@@ -13,7 +13,7 @@ Environment:
   SRC_SYS, DRY_RUN, APP_SCOPE_DEFAULT, APP_ONBOARDING_DEFAULT
 """
 
-import os, sys, io, json, yaml, hashlib
+import os, sys, io, json, yaml, hashlib, time
 from datetime import datetime, timezone
 import psycopg2
 from psycopg2 import extras
@@ -178,10 +178,8 @@ def upsert_fields(cur, rows):
     """, rows)
 
 # --------------------------------------------------------------------------------------
-# Process staged rows
+# Process staged rows (with debugging and counters)
 # --------------------------------------------------------------------------------------
-import time
-
 def process_rows(tgt_conn, registry):
     now_utc = datetime.now(timezone.utc)
     reg_by_src = {}
@@ -260,14 +258,15 @@ def process_rows(tgt_conn, registry):
                 upsert_fields(cur, context_rows)
                 upsert_fields(cur, derived_rows)
                 after = time.time()
-                print(f"Row {row_count}: Upserted {len(context_rows)} context fields "
-                      f"and {len(derived_rows)} derived fields "
-                      f"in {after - before:.3f}s.")
+                print(
+                    f"Row {row_count}: Upserted {len(context_rows)} context fields "
+                    f"and {len(derived_rows)} derived fields in {after - before:.3f}s."
+                )
 
             stats["fields_written"] += len(context_rows) + len(derived_rows)
-            # Print progress every 10 rows, always print the last
+            # Progress every 10 rows or at the end
             if row_count % 10 == 0 or row_count == len(rows):
-                print(f"Processed {row_count}/{len(rows)} rows...")
+                print(f"Processed {row_count}/{len(rows)} rows.")
 
     elapsed = time.time() - start
     print(f"All rows processed: {row_count} in {elapsed:.2f}s.")
@@ -299,7 +298,6 @@ def main():
         print(json.dumps(stats, indent=2, default=str))
         if DRY_RUN:
             print("NOTE: DRY_RUN=1 → profile/profile_field writes skipped")
-
 
 if __name__ == "__main__":
     try:
