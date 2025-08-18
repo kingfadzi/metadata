@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
-# etl_profiles_from_registry.py
-#
-# Flat, config-first ETL:
-#   1) Extract ODS rows (Postgres -> Postgres)
-#   2) Derive CIA+S signals (worst per app)
-#   3) Apply YAML registry (derived_from + rule)
-#   4) Upsert profiles + fields (profile_id deterministic; profile_field.id deterministic)
-#
-import os
-import sys
-import yaml
-import hashlib
-import pandas as pd
-import psycopg2
-from psycopg2.extras import execute_values, DictCursor, Json
-from datetime import datetime, timezone
+"""
+etl_profiles_from_registry_lite.py
 
-# ---- Config (env) ----
+Flow:
+  1) Stage ODS rows into TEMP tmp_src via COPY
+  2) Upsert APPLICATION from tmp_src
+  3) Derive fine-grained metrics using YAML registry
+  4) Upsert profile + profile_field (deterministic IDs)
+
+Environment:
+  ODS_DSN, TGT_DSN, REGISTRY_YAML, PROFILE_SCOPE, PROFILE_VERSION,
+  SRC_SYS, DRY_RUN, APP_SCOPE_DEFAULT, APP_ONBOARDING_DEFAULT
+"""
+
+import os, sys, io, json, yaml, hashlib
+from datetime import datetime, timezone
+import psycopg2
+from psycopg2 import extras
+from psycopg2.extras import DictCursor, execute_values
+
+# --------------------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------------------
 ODS_DSN       = os.getenv("ODS_DSN", "postgresql://postgres:postgres@192.168.1.188:5432/lct_data")
 TGT_DSN       = os.getenv("TGT_DSN", "postgresql://postgres:postgres@192.168.1.188:5432/lct_data")
 REGISTRY_PATH = os.getenv("REGISTRY_YAML", "fields.v1.yaml")
+SCOPE_TYPE      = os.getenv("PROFILE_SCOPE", "application")
+PROFILE_VERSION = int(os.getenv("PROFILE_VERSION", "1"))
+SRC_SYS         = os.getenv("SRC_SYS", "ODS")
+DRY_RUN         = os.getenv("DRY_RUN", "0") == "1"
+APP_SCOPE_DEFAULT      = os.getenv("APP_SCOPE_DEFAULT", "application")
+APP_ONBOARDING_DEFAULT = os.getenv("APP_ONBOARDING_DEFAULT", "pending")
 
-SCOPE_TYPE = "application"   # matches DDL: profile.scope_type TEXT
-VERSION    = 1               # matches DDL: profile.version INT
-SRC_SYS    = "ODS"           # provenance
-
+# --------------------------------------------------------------------------------------
+# SQL source query
+# --------------------------------------------------------------------------------------
 SQL = """
-SELECT
+SELECT DISTINCT
   lca.lean_control_service_id,
   lpbd.jira_backlog_id,
-  si.it_service_instance,
   so.service_offering_join,
   so.app_criticality_assessment AS app_criticality,
   so.security_rating            AS security_rating,
@@ -48,223 +57,221 @@ JOIN public.vwsfbusinessapplication child_app
   ON si.business_application_sysid = child_app.business_application_sys_id
 JOIN public.spdw_vwsfservice_offering so
   ON so.service_offering_join = si.service_offering_join
-ORDER BY si.it_service_instance;
+ORDER BY so.service_offering_join
 """
+
+# --------------------------------------------------------------------------------------
+# Helpers: IDs, normalization, registry
+# --------------------------------------------------------------------------------------
+def profile_pk(scope_type: str, scope_id: str, version: int) -> str:
+    return "prof_" + hashlib.md5(f"{scope_type}:{scope_id}:{version}".encode()).hexdigest()
+
+def field_pk(profile_id: str, key: str) -> str:
+    return "pf_" + hashlib.md5(f"{profile_id}:{key}".encode()).hexdigest()
+
+VALID_LETTERS    = {"A", "B", "C", "D"}
+VALID_SECURITY   = {"A1", "A2", "B", "C", "D"}
+VALID_RESILIENCE = {"0", "1", "2", "3", "4"}
+
+def normalize(val, allowed, default, transform=str.upper):
+    if not val:
+        return default
+    v = transform(str(val).strip())
+    return v if v in allowed else default
+
+def norm_security(val):
+    return normalize(val, VALID_SECURITY, "A2", lambda x: "A1" if x.upper() == "A" else x.upper())
 
 def load_registry(path: str) -> list[dict]:
     with open(path, "r") as f:
-        y = yaml.safe_load(f)
-    flat: list[dict] = []
-    fields = (y or {}).get("fields", {})
-    for domain, items in (fields or {}).items():
-        for it in (items or []):
-            d = dict(it)
-            d["domain"] = domain
-            flat.append(d)
-    return flat
-
-def extract_df() -> pd.DataFrame:
-    # pandas will warn about non-SQLAlchemy connection; safe to ignore
-    with psycopg2.connect(ODS_DSN) as conn:
-        return pd.read_sql_query(SQL, conn)
-
-def worst_letter(series: pd.Series, order: list[str]) -> pd.Series:
-    dtype = pd.CategoricalDtype(categories=order, ordered=True)
-    s = series.astype("string").str.strip().str.upper().astype(dtype)
-    return s.groupby(level=0).min()
-
-def confidentiality_from_security(sec: pd.Series) -> pd.Series:
-    s = sec.astype("string").str.strip().str.upper().replace({"A": "A1"})
-    return s.map({"A1": "High", "A2": "High", "B": "Medium", "C": "Low", "D": "Low"})
-
-def aggregate_signals(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    df = df.set_index("app_correlation_id", drop=True)
-
-    abcd   = ["A", "B", "C", "D"]
-    a12bcd = ["A1", "A2", "B", "C", "D"]
-
-    crit  = worst_letter(df["app_criticality"], abcd)
-    integ = worst_letter(df["integrity_rating"], abcd)
-    avail = worst_letter(df["availability_rating"], abcd)
-    resil = worst_letter(df["resilience_rating"], abcd)
-
-    sec = (
-        df["security_rating"]
-        .astype("string").str.strip().str.upper().replace({"A": "A1"})
-        .astype(pd.CategoricalDtype(categories=a12bcd, ordered=True))
-        .groupby(level=0).min().astype(str)
-    )
-
-    app_ids = crit.index
-    agg = pd.DataFrame({
-        "app_correlation_id": app_ids,
-        "app.criticality": crit.astype(str).values,
-        "integrity":        integ.astype(str).values,
-        "availability":     avail.astype(str).values,
-        "resilience":       resil.astype(str).values,
-        "security_rating":  sec.values,
-    })
-
-    agg["confidentiality"] = confidentiality_from_security(agg["security_rating"])
-
-    def first_non_null(s: pd.Series):
-        s = s.dropna()
-        return s.iloc[0] if not s.empty else None
-
-    def mode_or_first(s: pd.Series):
-        s = s.dropna()
-        if s.empty:
-            return None
-        m = s.mode()
-        return m.iloc[0] if not m.empty else s.iloc[0]
-
-    by_app = df.groupby(level=0)
-    agg["lean_control_service_id"] = by_app["lean_control_service_id"].apply(first_non_null).values
-    agg["jira_backlog_id"]         = by_app["jira_backlog_id"].apply(first_non_null).values
-    agg["service_offering_join"]   = by_app["service_offering_join"].apply(mode_or_first).values
-
-    return agg
-
-def apply_registry(agg: pd.DataFrame, registry: list[dict]) -> pd.DataFrame:
-    rows: list[tuple[str, str, object]] = []
-    for _, app in agg.iterrows():
-        app_id = str(app["app_correlation_id"])
-        for f in registry:
-            src = f.get("derived_from"); rule = f.get("rule")
-            if not src or not rule:
-                continue
-            src_val = str(app.get(src, "")).strip()
-            if not src_val:
-                continue
-            mapped = rule.get(src_val)
-            if mapped is None:
-                continue
-            rows.append((app_id, f["key"], mapped))
-    return pd.DataFrame(rows, columns=["entity_id", "key", "value"])
-
-def _profile_pk(scope_type: str, scope_id: str, version: int) -> str:
-    h = hashlib.md5(f"{scope_type}:{scope_id}:{version}".encode("utf-8")).hexdigest()
-    return f"prof_{h}"
-
-def upsert_to_target(derived_kv: pd.DataFrame, agg: pd.DataFrame):
-    if agg is None or agg.empty:
-        print("No profiles to upsert.")
-        return
-
-    now_utc = datetime.now(timezone.utc)
-
-    # Anchors (deterministic profile_id)
-    profile_rows = []
-    for app_id in agg["app_correlation_id"].astype(str):
-        pid = _profile_pk(SCOPE_TYPE, app_id, VERSION)
-        profile_rows.append((pid, SCOPE_TYPE, app_id, VERSION))
-
-    # Base fields to persist
-    base_fields = [
-        "app.criticality", "integrity", "availability", "resilience",
-        "security_rating", "confidentiality",
-        "lean_control_service_id", "jira_backlog_id", "service_offering_join",
+        y = yaml.safe_load(f) or {}
+    return [
+        {"key": i["key"], "derived_from": i["derived_from"], "rule": i["rule"]}
+        for i in (y.get("fields") or [])
+        if isinstance(i, dict) and i.get("key") and i.get("derived_from") and isinstance(i.get("rule"), dict)
     ]
 
-    base_kv = []
-    for _, row in agg.iterrows():
-        eid = str(row.app_correlation_id)
-        src_ref = None if pd.isna(row.get("jira_backlog_id")) else str(row.get("jira_backlog_id"))
-        for k in base_fields:
-            v = row.get(k)
-            if pd.isna(v):
-                continue
-            base_kv.append((eid, k, Json(v), SRC_SYS, src_ref, now_utc))
+# --------------------------------------------------------------------------------------
+# Stage ODS → tmp_src
+# --------------------------------------------------------------------------------------
+def stage_source_rows(tgt_conn, ods_conn) -> int:
+    with tgt_conn.cursor() as cur_tgt, ods_conn.cursor() as cur_ods:
+        cur_tgt.execute("""
+            CREATE TEMP TABLE tmp_src (
+              lean_control_service_id  text,
+              jira_backlog_id          text,
+              service_offering_join    text,
+              app_criticality          text,
+              security_rating          text,
+              integrity_rating         text,
+              availability_rating      text,
+              resilience_rating        text,
+              app_correlation_id       text
+            ) ON COMMIT DROP
+        """)
+        buf = io.StringIO()
+        cur_ods.copy_expert(f"COPY ({SQL}) TO STDOUT WITH CSV DELIMITER ',' NULL ''", buf)
+        data = buf.getvalue()
+        row_count = 0 if not data else data.count("\n")
+        buf.seek(0)
+        cur_tgt.copy_expert("COPY tmp_src FROM STDIN WITH CSV DELIMITER ',' NULL ''", buf)
+        return row_count
 
-    derived_rows = []
-    if derived_kv is not None and not derived_kv.empty:
-        for _, r in derived_kv.iterrows():
-            if pd.isna(r.value):
-                continue
-            derived_rows.append((str(r.entity_id), str(r.key), Json(r.value), SRC_SYS, None, now_utc))
+# --------------------------------------------------------------------------------------
+# Upserts
+# --------------------------------------------------------------------------------------
+def upsert_applications_from_stage(tgt_conn, scope=APP_SCOPE_DEFAULT, onboarding=APP_ONBOARDING_DEFAULT):
+    with tgt_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO application (
+                app_id, scope, app_criticality_assessment,
+                jira_backlog_id, lean_control_service_id,
+                onboarding_status, updated_at
+            )
+            SELECT DISTINCT
+                s.app_correlation_id,
+                %s,
+                CASE
+                  WHEN UPPER(NULLIF(s.app_criticality,'')) IN ('A','B','C','D')
+                    THEN UPPER(NULLIF(s.app_criticality,''))
+                  ELSE NULL END,
+                NULLIF(s.jira_backlog_id,''),
+                NULLIF(s.lean_control_service_id,''),
+                %s,
+                now()
+            FROM tmp_src s
+            WHERE s.app_correlation_id IS NOT NULL
+            ON CONFLICT (app_id) DO UPDATE SET
+                app_criticality_assessment = COALESCE(EXCLUDED.app_criticality_assessment, application.app_criticality_assessment),
+                jira_backlog_id            = COALESCE(EXCLUDED.jira_backlog_id, application.jira_backlog_id),
+                lean_control_service_id    = COALESCE(EXCLUDED.lean_control_service_id, application.lean_control_service_id),
+                scope                      = COALESCE(application.scope, EXCLUDED.scope),
+                onboarding_status          = COALESCE(application.onboarding_status, EXCLUDED.onboarding_status),
+                updated_at                 = now();
+        """, (scope, onboarding))
 
-    all_rows = base_kv + derived_rows
+def upsert_profile(cur, profile_id: str, scope_type: str, scope_id: str, version: int):
+    cur.execute("""
+        INSERT INTO profile (profile_id, scope_type, scope_id, version)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (scope_type, scope_id, version)
+        DO UPDATE SET updated_at = now()
+    """, (profile_id, scope_type, scope_id, version))
 
-    with psycopg2.connect(TGT_DSN) as tgt, tgt.cursor(cursor_factory=DictCursor) as cur:
-        # Upsert anchors
-        execute_values(cur, """
-            INSERT INTO profile (profile_id, scope_type, scope_id, version)
-            VALUES %s
-            ON CONFLICT (scope_type, scope_id, version)
-            DO UPDATE SET updated_at = now()
-        """, profile_rows)
-
-        if all_rows:
-            # Stage fields (entity_id text; value jsonb)
-            cur.execute("""
-                CREATE TEMP TABLE tmp_profile_field (
-                  entity_id     text,
-                  key           text,
-                  value         jsonb,
-                  source_system text,
-                  source_ref    text,
-                  collected_at  timestamptz
-                ) ON COMMIT DROP;
-            """)
-            execute_values(cur, """
-                INSERT INTO tmp_profile_field (entity_id, key, value, source_system, source_ref, collected_at)
-                VALUES %s
-            """, all_rows)
-
-            # Insert/Upsert into profile_field with a deterministic id
-            # id = 'pf_' || md5(profile_id || ':' || key)
-            cur.execute("""
-                INSERT INTO profile_field
-                  (id, profile_id, key, value, source_system, source_ref, collected_at, updated_at)
-                SELECT
-                  'pf_' || md5(p.profile_id || ':' || t.key) AS id,
-                  p.profile_id,
-                  t.key,
-                  t.value,
-                  t.source_system,
-                  t.source_ref,
-                  t.collected_at,
-                  now()
-                FROM tmp_profile_field t
-                JOIN profile p
-                  ON p.scope_type = %s AND p.version = %s AND p.scope_id = t.entity_id
-                ON CONFLICT (profile_id, key)
-                DO UPDATE SET
-                  value         = EXCLUDED.value,
-                  source_system = EXCLUDED.source_system,
-                  source_ref    = EXCLUDED.source_ref,
-                  collected_at  = EXCLUDED.collected_at,
-                  updated_at    = now();
-            """, (SCOPE_TYPE, VERSION))
-
-        tgt.commit()
-
-def main():
-    print("Loading registry…")
-    registry = load_registry(REGISTRY_PATH)
-
-    print("Extracting rows…")
-    df = extract_df()
-    if df.empty:
-        print("No source rows. Nothing to do.")
+def upsert_fields(cur, rows):
+    if not rows:
         return
+    execute_values(cur, """
+        INSERT INTO profile_field
+            (id, profile_id, key, value, source_system, source_ref, collected_at, updated_at)
+        VALUES %s
+        ON CONFLICT (profile_id, key) DO UPDATE SET
+          value         = EXCLUDED.value,
+          source_system = EXCLUDED.source_system,
+          source_ref    = EXCLUDED.source_ref,
+          collected_at  = EXCLUDED.collected_at,
+          updated_at    = now()
+    """, rows)
 
-    print("Aggregating CIA+S signals…")
-    agg = aggregate_signals(df)
+# --------------------------------------------------------------------------------------
+# Process staged rows
+# --------------------------------------------------------------------------------------
+def process_rows(tgt_conn, registry):
+    now_utc = datetime.now(timezone.utc)
+    reg_by_src = {}
+    for item in registry:
+        reg_by_src.setdefault(item["derived_from"], []).append(item)
 
-    print("Applying registry rules…")
-    derived_kv = apply_registry(agg, registry)
+    stats = {"profiles_written": 0, "fields_written": 0,
+             "skipped_missing_input": 0, "skipped_no_rule": 0}
 
-    print("Writing to target…")
-    upsert_to_target(derived_kv, agg)
+    with tgt_conn.cursor(cursor_factory=DictCursor) as cur:
+        cur.execute("SELECT * FROM tmp_src;")
+        for r in cur.fetchall():
+            app_id = r["app_correlation_id"]
+            if not app_id:
+                continue
 
-    print(f"Done. Profiles: {len(agg)}; derived fields written: {0 if derived_kv is None else len(derived_kv)}")
+            # Normalized base ratings
+            row_ctx = dict(
+                security_rating     = norm_security(r["security_rating"]),
+                integrity_rating    = normalize(r["integrity_rating"], VALID_LETTERS, "C"),
+                availability_rating = normalize(r["availability_rating"], VALID_LETTERS, "C"),
+                resilience_rating   = normalize(r["resilience_rating"], VALID_RESILIENCE, "2", str),
+                app_criticality     = normalize(r["app_criticality"], VALID_LETTERS, "C"),
+            )
+
+            pid = profile_pk(SCOPE_TYPE, app_id, PROFILE_VERSION)
+            upsert_profile(cur, pid, SCOPE_TYPE, app_id, PROFILE_VERSION)
+            stats["profiles_written"] += 1
+
+            def make_field(key, value, src_ref):
+                return (field_pk(pid, key), pid, key, extras.Json(value),
+                        SRC_SYS, src_ref, now_utc, now_utc)
+
+
+            src_ref = r.get("jira_backlog_id")
+            context_rows = [make_field(k, row_ctx[k], src_ref)
+                            for k in ("security_rating", "integrity_rating",
+                                      "availability_rating", "resilience_rating",
+                                      "app_criticality")]
+            # copy extra IDs if present
+            for k in ("lean_control_service_id","jira_backlog_id","service_offering_join"):
+                if r.get(k):
+                    context_rows.append(make_field(k, str(r[k]).strip(), src_ref))
+
+            # Derived fields
+            derived_rows = []
+            for src_key, items in reg_by_src.items():
+                src_val = row_ctx.get(src_key)
+                if not src_val:
+                    stats["skipped_missing_input"] += len(items)
+                    continue
+                for it in items:
+                    out = it["rule"].get(str(src_val))
+                    if out is None:
+                        stats["skipped_no_rule"] += 1
+                    else:
+                        derived_rows.append(make_field(it["key"], out, src_ref))
+
+            if not DRY_RUN:
+                upsert_fields(cur, context_rows)
+                upsert_fields(cur, derived_rows)
+
+            stats["fields_written"] += len(context_rows) + len(derived_rows)
+    return stats
+
+# --------------------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------------------
+def main():
+    print("Loading registry:", REGISTRY_PATH)
+    registry = load_registry(REGISTRY_PATH)
+    print(f"Registry fields: {len(registry)}")
+
+    with psycopg2.connect(TGT_DSN) as tgt_conn, psycopg2.connect(ODS_DSN) as ods_conn:
+        rows_staged = stage_source_rows(tgt_conn, ods_conn)
+        print(f"Staged {rows_staged} rows.")
+        if rows_staged == 0:
+            print("No rows. Exiting.")
+            return
+
+        print("Upserting applications...")
+        upsert_applications_from_stage(tgt_conn)
+
+        print("Processing profiles...")
+        stats = process_rows(tgt_conn, registry)
+
+        print("Done.")
+        print(json.dumps(stats, indent=2, default=str))
+        if DRY_RUN:
+            print("NOTE: DRY_RUN=1 → profile/profile_field writes skipped")
+
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    except Exception:
+        import traceback
+        traceback.print_exc()
         sys.exit(1)

@@ -18,16 +18,20 @@ DROP TABLE IF EXISTS application CASCADE;
 -- =========================
 -- APPLICATION  (TEXT IDs)
 -- =========================
-CREATE TABLE application (
-                             app_id             text PRIMARY KEY,
-                             scope              text NOT NULL,  -- e.g., business domain / tenant
-                             parent_app_id      text REFERENCES application(app_id) ON DELETE SET NULL,
-                             name               text NOT NULL,
-                             repo_id            text,
-                             operational_status text,  -- e.g., active/sunset/deprecated
-                             onboarding_status  text NOT NULL CHECK (onboarding_status IN ('pending','in_progress','onboarded')),
-                             created_at         timestamptz NOT NULL DEFAULT now(),
-                             updated_at         timestamptz NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS application (
+       app_id                  text PRIMARY KEY,                     -- = app_correlation_id
+       scope                   text NOT NULL DEFAULT 'application',  -- use CHECK/enum later if you want
+       parent_app_id           text,
+       name                    text,
+       app_criticality_assessment text,                              -- A/B/C/D (normalized)
+       jira_backlog_id         text,
+       lean_control_service_id text,
+       repo_id                 text,
+       operational_status      text,
+       onboarding_status       text NOT NULL DEFAULT 'pending',      -- pending | in_progress | onboarded
+       owner_id                text,
+       created_at              timestamptz NOT NULL DEFAULT now(),
+       updated_at              timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_application_scope  ON application(scope);
