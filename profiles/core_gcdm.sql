@@ -78,7 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_profile_version ON profile(version);
 CREATE TABLE profile_field (
                                id            text PRIMARY KEY,
                                profile_id    text NOT NULL REFERENCES profile(profile_id) ON DELETE CASCADE,
-                               key           text NOT NULL,     -- namespaced key, e.g., 'app.criticality'
+                               field_key     text NOT NULL,     -- namespaced key, e.g., 'app.criticality'
                                value         jsonb,             -- store as jsonb for flexibility & indexing
                                confidence    text,              -- e.g., 'derived','owner','system'
                                source_system text,              -- provenance (e.g., 'ODS')
@@ -86,11 +86,11 @@ CREATE TABLE profile_field (
                                collected_at  timestamptz,
                                created_at    timestamptz NOT NULL DEFAULT now(),
                                updated_at    timestamptz NOT NULL DEFAULT now(),
-                               CONSTRAINT uq_profile_field UNIQUE (profile_id, key)
+                               CONSTRAINT uq_profile_field UNIQUE (profile_id, field_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_profile_field_profile ON profile_field(profile_id);
-CREATE INDEX IF NOT EXISTS idx_profile_field_key     ON profile_field(key);
+CREATE INDEX IF NOT EXISTS idx_profile_field_key     ON profile_field(field_key);
 -- Optional: JSONB GIN index if you’ll query by value frequently
 -- CREATE INDEX IF NOT EXISTS idx_profile_field_value_gin ON profile_field USING gin (value jsonb_path_ops);
 
@@ -217,6 +217,7 @@ END$$;
 -- =========================
 -- Helpful views
 -- =========================
+
 -- Latest profile per application
 CREATE OR REPLACE VIEW v_app_profiles_latest AS
 SELECT p.*
@@ -233,6 +234,13 @@ FROM profile p
 
 -- Flattened profile fields for quick querying
 CREATE OR REPLACE VIEW v_profile_fields AS
-SELECT p.scope_type, p.scope_id, p.version, f.key, f.value, f.source_system, f.source_ref, f.collected_at
+SELECT p.scope_type,
+       p.scope_id,
+       p.version,
+       f.field_key,
+       f.value,
+       f.source_system,
+       f.source_ref,
+       f.collected_at
 FROM profile p
          JOIN profile_field f ON f.profile_id = p.profile_id;
