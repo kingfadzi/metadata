@@ -180,18 +180,32 @@ def upsert_fields(cur, rows):
 # --------------------------------------------------------------------------------------
 # Process staged rows
 # --------------------------------------------------------------------------------------
+import time
+
 def process_rows(tgt_conn, registry):
     now_utc = datetime.now(timezone.utc)
     reg_by_src = {}
     for item in registry:
         reg_by_src.setdefault(item["derived_from"], []).append(item)
 
-    stats = {"profiles_written": 0, "fields_written": 0,
-             "skipped_missing_input": 0, "skipped_no_rule": 0}
+    stats = {
+        "profiles_written": 0,
+        "fields_written": 0,
+        "skipped_missing_input": 0,
+        "skipped_no_rule": 0
+    }
+    print("Starting process_rows...")
+    row_count = 0
+    start = time.time()
 
     with tgt_conn.cursor(cursor_factory=DictCursor) as cur:
+        print("Running: SELECT * FROM tmp_src;")
         cur.execute("SELECT * FROM tmp_src;")
-        for r in cur.fetchall():
+        rows = cur.fetchall()
+        print(f"Fetched {len(rows)} rows from tmp_src.")
+
+        for r in rows:
+            row_count += 1
             app_id = r["app_correlation_id"]
             if not app_id:
                 continue
@@ -210,17 +224,20 @@ def process_rows(tgt_conn, registry):
             stats["profiles_written"] += 1
 
             def make_field(key, value, src_ref):
-                return (field_pk(pid, key), pid, key, extras.Json(value),
-                        SRC_SYS, src_ref, now_utc, now_utc)
-
+                return (
+                    field_pk(pid, key), pid, key, extras.Json(value),
+                    SRC_SYS, src_ref, now_utc, now_utc
+                )
 
             src_ref = r.get("jira_backlog_id")
             context_rows = [make_field(k, row_ctx[k], src_ref)
-                            for k in ("security_rating", "integrity_rating",
-                                      "availability_rating", "resilience_rating",
-                                      "app_criticality")]
+                            for k in (
+                                "security_rating", "integrity_rating",
+                                "availability_rating", "resilience_rating",
+                                "app_criticality"
+                            )]
             # copy extra IDs if present
-            for k in ("lean_control_service_id","jira_backlog_id","service_offering_join"):
+            for k in ("lean_control_service_id", "jira_backlog_id", "service_offering_join"):
                 if r.get(k):
                     context_rows.append(make_field(k, str(r[k]).strip(), src_ref))
 
@@ -239,10 +256,22 @@ def process_rows(tgt_conn, registry):
                         derived_rows.append(make_field(it["key"], out, src_ref))
 
             if not DRY_RUN:
+                before = time.time()
                 upsert_fields(cur, context_rows)
                 upsert_fields(cur, derived_rows)
+                after = time.time()
+                print(f"Row {row_count}: Upserted {len(context_rows)} context fields "
+                      f"and {len(derived_rows)} derived fields "
+                      f"in {after - before:.3f}s.")
 
             stats["fields_written"] += len(context_rows) + len(derived_rows)
+            # Print progress every 10 rows, always print the last
+            if row_count % 10 == 0 or row_count == len(rows):
+                print(f"Processed {row_count}/{len(rows)} rows...")
+
+    elapsed = time.time() - start
+    print(f"All rows processed: {row_count} in {elapsed:.2f}s.")
+    print("Stats:", stats)
     return stats
 
 # --------------------------------------------------------------------------------------
