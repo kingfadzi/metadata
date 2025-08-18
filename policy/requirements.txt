@@ -1,0 +1,8 @@
+psycopg[binary]
+python-dotenv
+pandas
+requests
+aioodbc
+asyncpg
+PyYAML
+psycopg2-binary

@@ -1,0 +1,14 @@
+Django==5.1
+psycopg[binary]
+python-dotenv
+pandas
+in-toto[cli]
+ed25519
+requests
+
+aioodbc
+asyncpg
+PyYAML
+tenacity
+filelock
+psycopg2-binary

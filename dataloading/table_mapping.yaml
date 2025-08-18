@@ -1,0 +1,33 @@
+databases:
+  - name: sqlserver_migration
+    source_type: sqlserver
+    source_db: "DSN=sqlserver_source"
+    target_db: "postgresql://user:pass@host/db"
+    enabled: true
+
+    tables:
+      - source: dbo.component_tool_mapping
+        dest: public.component_mapping_grouped
+
+        # select ONLY the grouped columns (add aggregates if you need other fields)
+        columns: [component_id, mapping_type]
+        group_by: [component_id, mapping_type]
+
+        # keep ORDER BY on the same columns to keep SQL Server happy with GROUP BY + ORDER BY
+        sort_columns: [component_id, mapping_type]
+
+        where: "mapping_type IN ('it_business_application','version_control','work_management')"
+        enabled: true
+
+        # Superset-like behavior / ODBC 17 tuning
+        sql_timeout: 300
+        row_limit: 1000000
+        odbc_extra: "Encrypt=no;TrustServerCertificate=yes;MARS_Connection=Yes;Connection Timeout=60;Login Timeout=30;Packet Size=32767"
+        inline_paging: true
+
+        pre_ddl_file: "metadata/sql/pre_component_mapping.sql"
+        post_ddl_file: "metadata/sql/component_mapping_repo_id.sql"
+
+        transforms:
+          plugins:
+            - "metadata.transformers.component_mapping_repo_id.extract_git_coordinates"

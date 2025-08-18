@@ -1,0 +1,38 @@
+database:
+  host: 192.168.1.188
+  port: 5432
+  name: lct_data
+  user: postgres
+  password: postgres
+
+sql: |
+  SELECT
+      lca.lean_control_service_id,
+      lpbd.jira_backlog_id,
+      si.it_service_instance,
+      so.service_offering_join,
+      so.app_criticality_assessment AS app_criticality,
+      so.security_rating AS security_rating,
+      so.integrity_rating AS integrity_rating,
+      so.availability_rating AS availability_rating,
+      so.resiliency_category AS resilience_rating
+  FROM public.vwsfitbusinessservice AS bs
+  JOIN public.lean_control_application AS lca
+    ON lca.servicenow_app_id = bs.service_correlation_id
+  JOIN public.vwsfitserviceinstance AS si
+    ON bs.it_business_service_sysid = si.it_business_service_sysid
+  JOIN public.lean_control_product_backlog_details AS lpbd
+    ON lpbd.lct_product_id = lca.lean_control_service_id
+   AND lpbd.is_parent = TRUE
+  JOIN public.vwsfbusinessapplication AS child_app
+    ON si.business_application_sysid = child_app.business_application_sys_id
+  JOIN public.spdw_vwsfservice_offering AS so
+    ON so.service_offering_join = si.service_offering_join
+  WHERE child_app.correlation_id = %(app_id)s
+  ORDER BY si.it_service_instance;
+
+opa:
+  url: "http://localhost:8181/v1/data/change_arb/result"
+  timeout_seconds: 5
+  headers:
+    Content-Type: "application/json"
