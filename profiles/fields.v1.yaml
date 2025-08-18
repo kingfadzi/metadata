@@ -1,0 +1,186 @@
+version: 1
+updated_at: 2025-08-18
+fields:
+
+  application:
+    - key: app.criticality
+      title: "Application Criticality"
+      description: "Overall risk tier of the application (A highest, D lowest)."
+
+    - key: app.materiality
+      title: "Materiality"
+      description: "Business materiality derived from criticality."
+      derived_from: app.criticality
+      rule:
+        A: crown_jewel
+        B: high
+        C: medium
+        D: low
+
+    - key: app.name
+      title: "Application Name"
+      description: "Canonical product/application name."
+
+    - key: app.business_unit
+      title: "Business Unit"
+      description: "Owning business unit for the application."
+
+    - key: app.owners
+      title: "Application Owners"
+      description: "List of accountable product and service owners."
+
+    - key: app.business_function
+      title: "Business Function"
+      description: "Primary business capability or function supported."
+
+  architecture:
+    - key: arch.component_type
+      title: "Component Type"
+      description: "Type of component (monolith, service, UI, etc.)."
+
+    - key: arch.hosting
+      title: "Hosting Environment"
+      description: "Where the application is hosted (on-prem, cloud, etc.)."
+
+    - key: arch.platform
+      title: "Platform"
+      description: "Underlying application platform or runtime."
+
+    - key: arch.network_zone
+      title: "Network Zone"
+      description: "Logical zone (internal, DMZ, partner)."
+
+    - key: arch.ingress
+      title: "Ingress Interfaces"
+      description: "Inbound integrations to the application."
+
+    - key: arch.egress
+      title: "Egress Interfaces"
+      description: "Outbound integrations from the application."
+
+    - key: arch.interfaces
+      title: "Internal Interfaces"
+      description: "Application internal APIs or connections."
+
+    - key: arch.third_parties
+      title: "Third Parties"
+      description: "External vendors or systems integrated."
+
+    - key: arch.sequence_diagram.evidence
+      title: "Sequence Diagram Evidence"
+      description: "Reference or upload of system interaction diagram."
+
+  data:
+    - key: data.classification
+      title: "Data Classification"
+      description: "Information handling class (restricted, confidential, internal, public)."
+      derived_from: confidentiality
+      rule:
+        A: restricted
+        B: confidential
+        C: internal
+        D: public
+
+    - key: data.pii_types
+      title: "PII Types"
+      description: "Personal data elements processed (e.g., PAN, SSN)."
+
+    - key: data.residency
+      title: "Data Residency"
+      description: "Regions/jurisdictions where data is stored or processed."
+
+    - key: data.retention_period
+      title: "Data Retention Period"
+      description: "Period data must be retained (e.g., 7 years)."
+
+    - key: data.dpa_link.evidence
+      title: "Data Protection Agreement Evidence"
+      description: "Reference or upload of DPA/contract."
+
+    - key: data.masking_applied
+      title: "Masking Applied"
+      description: "Whether data masking or tokenization is in place."
+
+  security:
+    - key: sec.encryption_at_rest
+      title: "Encryption at Rest"
+      description: "Whether the application’s data at rest is encrypted."
+      derived_from: confidentiality
+      rule:
+        A: "yes"
+        B: "yes"
+        C: "unknown"
+        D: "unknown"
+
+    - key: sec.kms_provider
+      title: "KMS Provider"
+      description: "Key management provider (e.g., AWS KMS, HSM)."
+
+    - key: sec.encryption_in_transit
+      title: "Encryption in Transit"
+      description: "Transport encryption mechanism (e.g., TLS 1.3)."
+
+    - key: sec.authn
+      title: "Authentication"
+      description: "Authentication mechanism (e.g., OIDC, SAML)."
+
+    - key: sec.authz
+      title: "Authorization"
+      description: "Authorization model (e.g., RBAC, ABAC)."
+
+    - key: sec.exposure_surface
+      title: "Exposure Surface"
+      description: "Exposure type (internal, partner, internet-facing)."
+
+    - key: sec.sast_coverage
+      title: "SAST Coverage"
+      description: "Static application security testing coverage level."
+
+    - key: sec.dast_coverage
+      title: "DAST Coverage"
+      description: "Dynamic application security testing coverage level."
+
+    - key: sec.pentest.evidence
+      title: "Pen Test Evidence"
+      description: "Reference or upload of penetration test report."
+
+    - key: sec.secrets_management
+      title: "Secrets Management"
+      description: "Approach used (Vault, KMS, etc.)."
+
+  resilience:
+    - key: res.rto_hours
+      title: "Recovery Time Objective (RTO)"
+      description: "Target recovery time in hours."
+      derived_from: availability
+      rule:
+        A: 1
+        B: 4
+        C: 24
+        D: best_effort
+
+    - key: res.rpo_minutes
+      title: "Recovery Point Objective (RPO)"
+      description: "Target recovery point in minutes."
+      derived_from: availability
+      rule:
+        A: 5
+        B: 60
+        C: 240
+        D: best_effort
+
+    - key: res.ha_topology
+      title: "High Availability Topology"
+      description: "Deployment topology (AA, AP, none)."
+
+    - key: res.backup_enabled
+      title: "Backup Enabled"
+      description: "Whether backup is enabled."
+
+    - key: res.dr_runbook.evidence
+      title: "Disaster Recovery Runbook Evidence"
+      description: "Reference or upload of DR runbook."
+
+    - key: res.last_dr_test_date
+      title: "Last DR Test Date"
+      description: "Date of most recent disaster recovery test."
