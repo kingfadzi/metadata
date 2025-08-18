@@ -125,7 +125,7 @@ def prepare_data_for_bulk(tgt_conn, registry):
 
     applications = {}
     profiles = {}
-    profile_fields = []
+    profile_fields_dict = {}   # DEDUP: key = (profile_id, key)
 
     with tgt_conn.cursor(cursor_factory=DictCursor) as cur:
         cur.execute("SELECT * FROM tmp_src;")
@@ -145,8 +145,7 @@ def prepare_data_for_bulk(tgt_conn, registry):
                 APP_ONBOARDING_DEFAULT,
                 now_utc
             )
-            # Only keep one application record per app_id (overwrite with last)
-            applications[app_id] = app_row
+            applications[app_id] = app_row  # dedup by app_id
 
             pid = profile_pk(SCOPE_TYPE, app_id, PROFILE_VERSION)
             profiles[pid] = (pid, SCOPE_TYPE, app_id, PROFILE_VERSION, now_utc)
@@ -160,19 +159,21 @@ def prepare_data_for_bulk(tgt_conn, registry):
             )
 
             src_ref = r.get("jira_backlog_id")
-            # Context fields
+            # Context fields - dedup by (profile_id, key)
             for k in ("security_rating", "integrity_rating", "availability_rating",
                       "resilience_rating", "app_criticality"):
-                profile_fields.append((
+                unique_key = (pid, k)
+                profile_fields_dict[unique_key] = (
                     field_pk(pid, k), pid, k, json.dumps(row_ctx[k]),
                     SRC_SYS, src_ref, now_utc, now_utc
-                ))
+                )
             for k in ("lean_control_service_id", "jira_backlog_id", "service_offering_join"):
                 if r.get(k):
-                    profile_fields.append((
+                    unique_key = (pid, k)
+                    profile_fields_dict[unique_key] = (
                         field_pk(pid, k), pid, k, json.dumps(str(r[k]).strip()),
                         SRC_SYS, src_ref, now_utc, now_utc
-                    ))
+                    )
             # Derived fields
             for src_key, items in reg_by_src.items():
                 src_val = row_ctx.get(src_key)
@@ -181,11 +182,15 @@ def prepare_data_for_bulk(tgt_conn, registry):
                 for it in items:
                     out = it["rule"].get(str(src_val))
                     if out is not None:
-                        profile_fields.append((
+                        unique_key = (pid, it["key"])
+                        profile_fields_dict[unique_key] = (
                             field_pk(pid, it["key"]), pid, it["key"], json.dumps(out),
                             SRC_SYS, src_ref, now_utc, now_utc
-                        ))
+                        )
+    # Collect deduped results
+    profile_fields = list(profile_fields_dict.values())
     return list(applications.values()), list(profiles.values()), profile_fields
+
 
 def write_csv(filename, rows, headers):
     with open(filename, "w", newline='') as f:
