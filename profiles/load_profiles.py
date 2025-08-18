@@ -128,19 +128,23 @@ def upsert_applications_from_stage(tgt_conn, scope=APP_SCOPE_DEFAULT, onboarding
                 jira_backlog_id, lean_control_service_id,
                 onboarding_status, updated_at
             )
-            SELECT DISTINCT
+            SELECT
                 s.app_correlation_id,
                 %s,
-                CASE
-                  WHEN UPPER(NULLIF(s.app_criticality,'')) IN ('A','B','C','D')
-                    THEN UPPER(NULLIF(s.app_criticality,''))
-                  ELSE NULL END,
-                NULLIF(s.jira_backlog_id,''),
-                NULLIF(s.lean_control_service_id,''),
+                MAX(
+                  CASE
+                    WHEN UPPER(NULLIF(s.app_criticality,'')) IN ('A','B','C','D')
+                      THEN UPPER(NULLIF(s.app_criticality,''))
+                    ELSE NULL
+                  END
+                ) as app_criticality_assessment,
+                MAX(NULLIF(s.jira_backlog_id,'')) as jira_backlog_id,
+                MAX(NULLIF(s.lean_control_service_id,'')) as lean_control_service_id,
                 %s,
                 now()
             FROM tmp_src s
             WHERE s.app_correlation_id IS NOT NULL
+            GROUP BY s.app_correlation_id
             ON CONFLICT (app_id) DO UPDATE SET
                 app_criticality_assessment = COALESCE(EXCLUDED.app_criticality_assessment, application.app_criticality_assessment),
                 jira_backlog_id            = COALESCE(EXCLUDED.jira_backlog_id, application.jira_backlog_id),
