@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-etl_profiles_from_registry_lite.py
+etl_profiles_from_registry_bulk.py
+
+Bulk-prepares tables as CSV, then does a single bulk load into target tables.
 
 Flow:
   1) Stage ODS rows into TEMP tmp_src via COPY
-  2) Upsert APPLICATION from tmp_src
-  3) Derive fine-grained metrics using YAML registry
-  4) Upsert profile + profile_field (deterministic IDs)
+  2) Prepare records for application, profile, profile_field as CSV
+  3) Load CSVs into target Postgres tables (COPY FROM)
 
 Environment:
   ODS_DSN, TGT_DSN, REGISTRY_YAML, PROFILE_SCOPE, PROFILE_VERSION,
   SRC_SYS, DRY_RUN, APP_SCOPE_DEFAULT, APP_ONBOARDING_DEFAULT
 """
 
-import os, sys, io, json, yaml, hashlib, time
+import os, sys, io, csv, json, yaml, hashlib, tempfile
 from datetime import datetime, timezone
 import psycopg2
-from psycopg2 import extras
-from psycopg2.extras import DictCursor, execute_values
+from psycopg2.extras import DictCursor
 
 # --------------------------------------------------------------------------------------
 # Config
@@ -28,9 +28,9 @@ REGISTRY_PATH = os.getenv("REGISTRY_YAML", "fields.v1.yaml")
 SCOPE_TYPE      = os.getenv("PROFILE_SCOPE", "application")
 PROFILE_VERSION = int(os.getenv("PROFILE_VERSION", "1"))
 SRC_SYS         = os.getenv("SRC_SYS", "ODS")
-DRY_RUN         = os.getenv("DRY_RUN", "0") == "1"
 APP_SCOPE_DEFAULT      = os.getenv("APP_SCOPE_DEFAULT", "application")
 APP_ONBOARDING_DEFAULT = os.getenv("APP_ONBOARDING_DEFAULT", "pending")
+DRY_RUN         = os.getenv("DRY_RUN", "0") == "1"
 
 # --------------------------------------------------------------------------------------
 # SQL source query
@@ -92,7 +92,7 @@ def load_registry(path: str) -> list[dict]:
     ]
 
 # --------------------------------------------------------------------------------------
-# Stage ODS → tmp_src
+# ETL Bulk Processing
 # --------------------------------------------------------------------------------------
 def stage_source_rows(tgt_conn, ods_conn) -> int:
     with tgt_conn.cursor() as cur_tgt, ods_conn.cursor() as cur_ods:
@@ -117,98 +117,40 @@ def stage_source_rows(tgt_conn, ods_conn) -> int:
         cur_tgt.copy_expert("COPY tmp_src FROM STDIN WITH CSV DELIMITER ',' NULL ''", buf)
         return row_count
 
-# --------------------------------------------------------------------------------------
-# Upserts
-# --------------------------------------------------------------------------------------
-def upsert_applications_from_stage(tgt_conn, scope=APP_SCOPE_DEFAULT, onboarding=APP_ONBOARDING_DEFAULT):
-    with tgt_conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO application (
-                app_id, scope, app_criticality_assessment,
-                jira_backlog_id, lean_control_service_id,
-                onboarding_status, updated_at
-            )
-            SELECT
-                s.app_correlation_id,
-                %s,
-                MAX(
-                  CASE
-                    WHEN UPPER(NULLIF(s.app_criticality,'')) IN ('A','B','C','D')
-                      THEN UPPER(NULLIF(s.app_criticality,''))
-                    ELSE NULL
-                  END
-                ) as app_criticality_assessment,
-                MAX(NULLIF(s.jira_backlog_id,'')) as jira_backlog_id,
-                MAX(NULLIF(s.lean_control_service_id,'')) as lean_control_service_id,
-                %s,
-                now()
-            FROM tmp_src s
-            WHERE s.app_correlation_id IS NOT NULL
-            GROUP BY s.app_correlation_id
-            ON CONFLICT (app_id) DO UPDATE SET
-                app_criticality_assessment = COALESCE(EXCLUDED.app_criticality_assessment, application.app_criticality_assessment),
-                jira_backlog_id            = COALESCE(EXCLUDED.jira_backlog_id, application.jira_backlog_id),
-                lean_control_service_id    = COALESCE(EXCLUDED.lean_control_service_id, application.lean_control_service_id),
-                scope                      = COALESCE(application.scope, EXCLUDED.scope),
-                onboarding_status          = COALESCE(application.onboarding_status, EXCLUDED.onboarding_status),
-                updated_at                 = now();
-        """, (scope, onboarding))
-
-def upsert_profile(cur, profile_id: str, scope_type: str, scope_id: str, version: int):
-    cur.execute("""
-        INSERT INTO profile (profile_id, scope_type, scope_id, version)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (scope_type, scope_id, version)
-        DO UPDATE SET updated_at = now()
-    """, (profile_id, scope_type, scope_id, version))
-
-def upsert_fields(cur, rows):
-    if not rows:
-        return
-    execute_values(cur, """
-        INSERT INTO profile_field
-            (id, profile_id, key, value, source_system, source_ref, collected_at, updated_at)
-        VALUES %s
-        ON CONFLICT (profile_id, key) DO UPDATE SET
-          value         = EXCLUDED.value,
-          source_system = EXCLUDED.source_system,
-          source_ref    = EXCLUDED.source_ref,
-          collected_at  = EXCLUDED.collected_at,
-          updated_at    = now()
-    """, rows)
-
-# --------------------------------------------------------------------------------------
-# Process staged rows (with debugging and counters)
-# --------------------------------------------------------------------------------------
-def process_rows(tgt_conn, registry):
-    now_utc = datetime.now(timezone.utc)
+def prepare_data_for_bulk(tgt_conn, registry):
+    now_utc = datetime.now(timezone.utc).isoformat()
     reg_by_src = {}
     for item in registry:
         reg_by_src.setdefault(item["derived_from"], []).append(item)
 
-    stats = {
-        "profiles_written": 0,
-        "fields_written": 0,
-        "skipped_missing_input": 0,
-        "skipped_no_rule": 0
-    }
-    print("Starting process_rows...")
-    row_count = 0
-    start = time.time()
+    applications = {}
+    profiles = {}
+    profile_fields = []
 
     with tgt_conn.cursor(cursor_factory=DictCursor) as cur:
-        print("Running: SELECT * FROM tmp_src;")
         cur.execute("SELECT * FROM tmp_src;")
         rows = cur.fetchall()
-        print(f"Fetched {len(rows)} rows from tmp_src.")
-
         for r in rows:
-            row_count += 1
             app_id = r["app_correlation_id"]
             if not app_id:
                 continue
 
-            # Normalized base ratings
+            app_crit = normalize(r["app_criticality"], VALID_LETTERS, None)
+            app_row = (
+                app_id,
+                APP_SCOPE_DEFAULT,
+                app_crit,
+                r["jira_backlog_id"] or None,
+                r["lean_control_service_id"] or None,
+                APP_ONBOARDING_DEFAULT,
+                now_utc
+            )
+            # Only keep one application record per app_id (overwrite with last)
+            applications[app_id] = app_row
+
+            pid = profile_pk(SCOPE_TYPE, app_id, PROFILE_VERSION)
+            profiles[pid] = (pid, SCOPE_TYPE, app_id, PROFILE_VERSION, now_utc)
+
             row_ctx = dict(
                 security_rating     = norm_security(r["security_rating"]),
                 integrity_rating    = normalize(r["integrity_rating"], VALID_LETTERS, "C"),
@@ -217,61 +159,96 @@ def process_rows(tgt_conn, registry):
                 app_criticality     = normalize(r["app_criticality"], VALID_LETTERS, "C"),
             )
 
-            pid = profile_pk(SCOPE_TYPE, app_id, PROFILE_VERSION)
-            upsert_profile(cur, pid, SCOPE_TYPE, app_id, PROFILE_VERSION)
-            stats["profiles_written"] += 1
-
-            def make_field(key, value, src_ref):
-                return (
-                    field_pk(pid, key), pid, key, extras.Json(value),
-                    SRC_SYS, src_ref, now_utc, now_utc
-                )
-
             src_ref = r.get("jira_backlog_id")
-            context_rows = [make_field(k, row_ctx[k], src_ref)
-                            for k in (
-                                "security_rating", "integrity_rating",
-                                "availability_rating", "resilience_rating",
-                                "app_criticality"
-                            )]
-            # copy extra IDs if present
+            # Context fields
+            for k in ("security_rating", "integrity_rating", "availability_rating",
+                      "resilience_rating", "app_criticality"):
+                profile_fields.append((
+                    field_pk(pid, k), pid, k, json.dumps(row_ctx[k]),
+                    SRC_SYS, src_ref, now_utc, now_utc
+                ))
             for k in ("lean_control_service_id", "jira_backlog_id", "service_offering_join"):
                 if r.get(k):
-                    context_rows.append(make_field(k, str(r[k]).strip(), src_ref))
-
+                    profile_fields.append((
+                        field_pk(pid, k), pid, k, json.dumps(str(r[k]).strip()),
+                        SRC_SYS, src_ref, now_utc, now_utc
+                    ))
             # Derived fields
-            derived_rows = []
             for src_key, items in reg_by_src.items():
                 src_val = row_ctx.get(src_key)
                 if not src_val:
-                    stats["skipped_missing_input"] += len(items)
                     continue
                 for it in items:
                     out = it["rule"].get(str(src_val))
-                    if out is None:
-                        stats["skipped_no_rule"] += 1
-                    else:
-                        derived_rows.append(make_field(it["key"], out, src_ref))
+                    if out is not None:
+                        profile_fields.append((
+                            field_pk(pid, it["key"]), pid, it["key"], json.dumps(out),
+                            SRC_SYS, src_ref, now_utc, now_utc
+                        ))
+    return list(applications.values()), list(profiles.values()), profile_fields
 
-            if not DRY_RUN:
-                before = time.time()
-                upsert_fields(cur, context_rows)
-                upsert_fields(cur, derived_rows)
-                after = time.time()
-                print(
-                    f"Row {row_count}: Upserted {len(context_rows)} context fields "
-                    f"and {len(derived_rows)} derived fields in {after - before:.3f}s."
-                )
+def write_csv(filename, rows, headers):
+    with open(filename, "w", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
 
-            stats["fields_written"] += len(context_rows) + len(derived_rows)
-            # Progress every 10 rows or at the end
-            if row_count % 10 == 0 or row_count == len(rows):
-                print(f"Processed {row_count}/{len(rows)} rows.")
+def copy_from_csv(conn, table, filename, columns):
+    with conn.cursor() as cur, open(filename, "r") as f:
+        cur.copy_expert(
+            f"""
+            COPY {table} ({', '.join(columns)})
+            FROM STDIN WITH CSV HEADER
+            """,
+            f
+        )
 
-    elapsed = time.time() - start
-    print(f"All rows processed: {row_count} in {elapsed:.2f}s.")
-    print("Stats:", stats)
-    return stats
+def load_bulk_to_postgres(apps, profiles, profile_fields):
+    # Prepare temp files
+    import tempfile, os
+    tmp = tempfile.gettempdir()
+    apps_file = os.path.join(tmp, "apps.csv")
+    profiles_file = os.path.join(tmp, "profiles.csv")
+    fields_file = os.path.join(tmp, "profile_fields.csv")
+
+    write_csv(apps_file, apps, [
+        "app_id", "scope", "app_criticality_assessment",
+        "jira_backlog_id", "lean_control_service_id", "onboarding_status", "updated_at"
+    ])
+    write_csv(profiles_file, profiles, [
+        "profile_id", "scope_type", "scope_id", "version", "updated_at"
+    ])
+    write_csv(fields_file, profile_fields, [
+        "id", "profile_id", "key", "value", "source_system", "source_ref", "collected_at", "updated_at"
+    ])
+
+    if DRY_RUN:
+        print(f"DRY_RUN=1: Would have loaded to Postgres:")
+        print(f"  {apps_file}, {profiles_file}, {fields_file}")
+        return
+
+    with psycopg2.connect(TGT_DSN) as conn:
+        with conn.cursor() as cur:
+            print("Truncating profile_field, profile, and application tables...")
+            cur.execute("TRUNCATE TABLE profile_field, profile, application CASCADE;")
+            conn.commit()
+
+        print("Loading application table from CSV...")
+        copy_from_csv(conn, "application", apps_file, [
+            "app_id", "scope", "app_criticality_assessment",
+            "jira_backlog_id", "lean_control_service_id", "onboarding_status", "updated_at"
+        ])
+        print("Loading profile table from CSV...")
+        copy_from_csv(conn, "profile", profiles_file, [
+            "profile_id", "scope_type", "scope_id", "version", "updated_at"
+        ])
+        print("Loading profile_field table from CSV...")
+        copy_from_csv(conn, "profile_field", fields_file, [
+            "id", "profile_id", "key", "value", "source_system", "source_ref", "collected_at", "updated_at"
+        ])
+        conn.commit()
+        print("Bulk load complete.")
+
 
 # --------------------------------------------------------------------------------------
 # Main
@@ -288,16 +265,14 @@ def main():
             print("No rows. Exiting.")
             return
 
-        print("Upserting applications...")
-        upsert_applications_from_stage(tgt_conn)
+        print("Preparing data for bulk load...")
+        apps, profiles, profile_fields = prepare_data_for_bulk(tgt_conn, registry)
+        print(f"Prepared: {len(apps)} apps, {len(profiles)} profiles, {len(profile_fields)} profile_fields.")
 
-        print("Processing profiles...")
-        stats = process_rows(tgt_conn, registry)
+    print("Loading bulk into target database...")
+    load_bulk_to_postgres(apps, profiles, profile_fields)
 
-        print("Done.")
-        print(json.dumps(stats, indent=2, default=str))
-        if DRY_RUN:
-            print("NOTE: DRY_RUN=1 → profile/profile_field writes skipped")
+    print("Done.")
 
 if __name__ == "__main__":
     try:
