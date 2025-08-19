@@ -200,7 +200,7 @@ def prepare_data_for_bulk(tgt_conn, registry):
                 app_criticality     = normalize(r["app_criticality"], VALID_LETTERS, "C"),
             )
 
-            src_ref = r.get("jira_backlog_id")
+            src_ref = r.get("app_correlation_id")
 
             # Persist core context fields
             for k in ("security_rating", "integrity_rating", "availability_rating",
