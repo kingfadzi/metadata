@@ -27,7 +27,7 @@ TGT_DSN       = os.getenv("TGT_DSN", "postgresql://postgres:postgres@192.168.1.1
 REGISTRY_PATH = os.getenv("REGISTRY_YAML", "fields.v1.yaml")
 SCOPE_TYPE      = os.getenv("PROFILE_SCOPE", "application")
 PROFILE_VERSION = int(os.getenv("PROFILE_VERSION", "1"))
-SRC_SYS         = os.getenv("SRC_SYS", "ODS")
+SRC_SYS         = os.getenv("SRC_SYS", "SERVICE_NOW")
 APP_SCOPE_DEFAULT      = os.getenv("APP_SCOPE_DEFAULT", "application")
 APP_ONBOARDING_DEFAULT = os.getenv("APP_ONBOARDING_DEFAULT", "pending")
 DRY_RUN         = os.getenv("DRY_RUN", "0") == "1"
@@ -45,17 +45,30 @@ SELECT DISTINCT
   so.integrity_rating           AS integrity_rating,
   so.availability_rating        AS availability_rating,
   so.resiliency_category        AS resilience_rating,
-  child_app.correlation_id      AS app_correlation_id
-FROM public.vwsfitbusinessservice bs
+  child_app.correlation_id      AS app_correlation_id,
+
+  -- newly requested child_app fields
+  child_app.owning_transaction_cycle             AS transaction_cycle,
+  child_app.application_type                     AS application_type,
+  child_app.application_tier                     AS application_tier,
+  child_app.business_application_name            AS business_application_name,
+  child_app.architecture_type                    AS architecture_type,
+  child_app.install_type                         AS install_type,
+  child_app.application_parent_correlation_id    AS application_parent_id,
+  child_app.house_position                       AS house_position,
+  child_app.application_product_owner             AS product_owner,
+  child_app.application_product_owner_brid        AS product_owner_brid,
+  child_app.operational_status                   AS operational_status
+FROM public.spdw_vwsfitbusinessservice bs
 JOIN public.lean_control_application lca
   ON lca.servicenow_app_id = bs.service_correlation_id
-JOIN public.vwsfitserviceinstance si
+JOIN public.spdw_vwsfitserviceinstance si
   ON bs.it_business_service_sysid = si.it_business_service_sysid
 JOIN public.lean_control_product_backlog_details lpbd
   ON lpbd.lct_product_id = lca.lean_control_service_id AND lpbd.is_parent = TRUE
-JOIN public.vwsfbusinessapplication child_app
+JOIN public.spdw_vwsfbusinessapplication child_app
   ON si.business_application_sysid = child_app.business_application_sys_id
-JOIN public.spdw_vwsfservice_offering so
+JOIN public.spdw_vwsfserviceoffering so
   ON so.service_offering_join = si.service_offering_join
 ORDER BY so.service_offering_join
 """
@@ -98,15 +111,27 @@ def stage_source_rows(tgt_conn, ods_conn) -> int:
     with tgt_conn.cursor() as cur_tgt, ods_conn.cursor() as cur_ods:
         cur_tgt.execute("""
             CREATE TEMP TABLE tmp_src (
-              lean_control_service_id  text,
-              jira_backlog_id          text,
-              service_offering_join    text,
-              app_criticality          text,
-              security_rating          text,
-              integrity_rating         text,
-              availability_rating      text,
-              resilience_rating        text,
-              app_correlation_id       text
+              lean_control_service_id    text,
+              jira_backlog_id            text,
+              service_offering_join      text,
+              app_criticality            text,
+              security_rating            text,
+              integrity_rating           text,
+              availability_rating        text,
+              resilience_rating          text,
+              app_correlation_id         text,
+
+              transaction_cycle          text,
+              application_type           text,
+              application_tier           text,
+              business_application_name  text,
+              architecture_type          text,
+              install_type               text,
+              application_parent_id      text,
+              house_position             text,
+              product_owner              text,
+              product_owner_brid         text,
+              operational_status         text
             ) ON COMMIT DROP
         """)
         buf = io.StringIO()
@@ -136,20 +161,37 @@ def prepare_data_for_bulk(tgt_conn, registry):
                 continue
 
             app_crit = normalize(r["app_criticality"], VALID_LETTERS, None)
+
+            # Build application row (maps requested child_app fields to application table columns)
             app_row = (
                 app_id,
                 APP_SCOPE_DEFAULT,
+                r["application_parent_id"] or None,         # parent_app_id
+                r["business_application_name"] or None,     # name
                 app_crit,
                 r["jira_backlog_id"] or None,
                 r["lean_control_service_id"] or None,
+                None,                                       # repo_id (not provided by source)
+                r["operational_status"] or None,
+                r["transaction_cycle"] or None,
+                r["application_type"] or None,
+                r["application_tier"] or None,
+                r["architecture_type"] or None,
+                r["install_type"] or None,
+                r["house_position"] or None,
+                r["product_owner"] or None,
+                r["product_owner_brid"] or None,
                 APP_ONBOARDING_DEFAULT,
-                now_utc
+                None,                                       # owner_id (unknown)
+                now_utc                                     # updated_at
             )
             applications[app_id] = app_row  # dedup by app_id
 
+            # Profile header
             pid = profile_pk(SCOPE_TYPE, app_id, PROFILE_VERSION)
             profiles[pid] = (pid, SCOPE_TYPE, app_id, PROFILE_VERSION, now_utc)
 
+            # Context fields that feed rules
             row_ctx = dict(
                 security_rating     = norm_security(r["security_rating"]),
                 integrity_rating    = normalize(r["integrity_rating"], VALID_LETTERS, "C"),
@@ -160,24 +202,25 @@ def prepare_data_for_bulk(tgt_conn, registry):
 
             src_ref = r.get("jira_backlog_id")
 
-            # Context fields - dedup by (profile_id, field_key)
+            # Persist core context fields
             for k in ("security_rating", "integrity_rating", "availability_rating",
                       "resilience_rating", "app_criticality"):
                 unique_key = (pid, k)
                 profile_fields_dict[unique_key] = (
-                    field_pk(pid, k), pid, k, json.dumps(row_ctx[k]),  # field_key (changed)
+                    field_pk(pid, k), pid, k, json.dumps(row_ctx[k]),
                     SRC_SYS, src_ref, now_utc, now_utc
                 )
 
+            # Useful source refs
             for k in ("lean_control_service_id", "jira_backlog_id", "service_offering_join"):
                 if r.get(k):
                     unique_key = (pid, k)
                     profile_fields_dict[unique_key] = (
-                        field_pk(pid, k), pid, k, json.dumps(str(r[k]).strip()),  # field_key (changed)
+                        field_pk(pid, k), pid, k, json.dumps(str(r[k]).strip()),
                         SRC_SYS, src_ref, now_utc, now_utc
                     )
 
-            # Derived fields
+            # Derived fields from registry
             for src_key, items in reg_by_src.items():
                 src_val = row_ctx.get(src_key)
                 if not src_val:
@@ -187,11 +230,10 @@ def prepare_data_for_bulk(tgt_conn, registry):
                     if out is not None:
                         unique_key = (pid, it["key"])
                         profile_fields_dict[unique_key] = (
-                            field_pk(pid, it["key"]), pid, it["key"], json.dumps(out),  # field_key (changed)
+                            field_pk(pid, it["key"]), pid, it["key"], json.dumps(out),
                             SRC_SYS, src_ref, now_utc, now_utc
                         )
 
-    # Collect deduped results
     profile_fields = list(profile_fields_dict.values())
     return list(applications.values()), list(profiles.values()), profile_fields
 
@@ -218,15 +260,34 @@ def load_bulk_to_postgres(apps, profiles, profile_fields):
     profiles_file = os.path.join(tmp, "profiles.csv")
     fields_file = os.path.join(tmp, "profile_fields.csv")
 
+    # application CSV (includes your new fields)
     write_csv(apps_file, apps, [
-        "app_id", "scope", "app_criticality_assessment",
-        "jira_backlog_id", "lean_control_service_id", "onboarding_status", "updated_at"
+        "app_id",
+        "scope",
+        "parent_app_id",
+        "name",
+        "app_criticality_assessment",
+        "jira_backlog_id",
+        "lean_control_service_id",
+        "repo_id",
+        "operational_status",
+        "transaction_cycle",
+        "application_type",
+        "application_tier",
+        "architecture_type",
+        "install_type",
+        "house_position",
+        "product_owner",
+        "product_owner_brid",
+        "onboarding_status",
+        "owner_id",
+        "updated_at"
     ])
+
     write_csv(profiles_file, profiles, [
         "profile_id", "scope_type", "scope_id", "version", "updated_at"
     ])
     write_csv(fields_file, profile_fields, [
-        # CHANGED: "field_key" instead of "key"
         "id", "profile_id", "field_key", "value", "source_system", "source_ref", "collected_at", "updated_at"
     ])
 
@@ -243,16 +304,35 @@ def load_bulk_to_postgres(apps, profiles, profile_fields):
 
         print("Loading application table from CSV...")
         copy_from_csv(conn, "application", apps_file, [
-            "app_id", "scope", "app_criticality_assessment",
-            "jira_backlog_id", "lean_control_service_id", "onboarding_status", "updated_at"
+            "app_id",
+            "scope",
+            "parent_app_id",
+            "name",
+            "app_criticality_assessment",
+            "jira_backlog_id",
+            "lean_control_service_id",
+            "repo_id",
+            "operational_status",
+            "transaction_cycle",
+            "application_type",
+            "application_tier",
+            "architecture_type",
+            "install_type",
+            "house_position",
+            "product_owner",
+            "product_owner_brid",
+            "onboarding_status",
+            "owner_id",
+            "updated_at"
         ])
+
         print("Loading profile table from CSV...")
         copy_from_csv(conn, "profile", profiles_file, [
             "profile_id", "scope_type", "scope_id", "version", "updated_at"
         ])
+
         print("Loading profile_field table from CSV...")
         copy_from_csv(conn, "profile_field", fields_file, [
-            # CHANGED: "field_key" instead of "key"
             "id", "profile_id", "field_key", "value", "source_system", "source_ref", "collected_at", "updated_at"
         ])
         conn.commit()

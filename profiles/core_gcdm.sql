@@ -19,16 +19,24 @@ DROP TABLE IF EXISTS application CASCADE;
 -- APPLICATION  (TEXT IDs)
 -- =========================
 CREATE TABLE IF NOT EXISTS application (
-       app_id                  text PRIMARY KEY,                     -- = app_correlation_id
-       scope                   text NOT NULL DEFAULT 'application',  -- use CHECK/enum later if you want
+       app_id                  text PRIMARY KEY,
+       scope                   text NOT NULL DEFAULT 'application',
        parent_app_id           text,
        name                    text,
-       app_criticality_assessment text,                              -- A/B/C/D (normalized)
+       app_criticality_assessment text,
        jira_backlog_id         text,
        lean_control_service_id text,
        repo_id                 text,
        operational_status      text,
-       onboarding_status       text NOT NULL DEFAULT 'pending',      -- pending | in_progress | onboarded
+       transaction_cycle       text,
+       application_type        text,
+       application_tier        text,
+       architecture_type       text,
+       install_type            text,
+       house_position          text,
+       product_owner           text,
+       product_owner_brid      text,
+       onboarding_status       text NOT NULL DEFAULT 'pending',
        owner_id                text,
        created_at              timestamptz NOT NULL DEFAULT now(),
        updated_at              timestamptz NOT NULL DEFAULT now()
