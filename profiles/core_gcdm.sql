@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS application (
        scope                   text NOT NULL DEFAULT 'application',
        parent_app_id           text,
        name                    text,
+       business_service_name    text,
        app_criticality_assessment text,
        jira_backlog_id         text,
        lean_control_service_id text,

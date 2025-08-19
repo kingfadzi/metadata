@@ -46,6 +46,7 @@ SELECT DISTINCT
   so.availability_rating        AS availability_rating,
   so.resiliency_category        AS resilience_rating,
   child_app.correlation_id      AS app_correlation_id,
+  bs.service                    AS business_service_name,
 
   -- newly requested child_app fields
   child_app.owning_transaction_cycle             AS transaction_cycle,
@@ -120,7 +121,7 @@ def stage_source_rows(tgt_conn, ods_conn) -> int:
               availability_rating        text,
               resilience_rating          text,
               app_correlation_id         text,
-
+              business_service_name      text,
               transaction_cycle          text,
               application_type           text,
               application_tier           text,
@@ -167,7 +168,8 @@ def prepare_data_for_bulk(tgt_conn, registry):
                 app_id,
                 APP_SCOPE_DEFAULT,
                 r["application_parent_id"] or None,         # parent_app_id
-                r["business_application_name"] or None,     # name
+                r["business_application_name"] or None,
+                r["business_service_name"] or None,
                 app_crit,
                 r["jira_backlog_id"] or None,
                 r["lean_control_service_id"] or None,
@@ -212,7 +214,7 @@ def prepare_data_for_bulk(tgt_conn, registry):
                 )
 
             # Useful source refs
-            for k in ("lean_control_service_id", "jira_backlog_id", "service_offering_join"):
+            for k in ("lean_control_service_id", "jira_backlog_id", "service_offering_join", "business_service_name"):
                 if r.get(k):
                     unique_key = (pid, k)
                     profile_fields_dict[unique_key] = (
@@ -266,6 +268,7 @@ def load_bulk_to_postgres(apps, profiles, profile_fields):
         "scope",
         "parent_app_id",
         "name",
+        "business_service_name",
         "app_criticality_assessment",
         "jira_backlog_id",
         "lean_control_service_id",
@@ -308,6 +311,7 @@ def load_bulk_to_postgres(apps, profiles, profile_fields):
             "scope",
             "parent_app_id",
             "name",
+            "business_service_name",
             "app_criticality_assessment",
             "jira_backlog_id",
             "lean_control_service_id",
