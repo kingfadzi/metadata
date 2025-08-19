@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS application (
        scope                   text NOT NULL DEFAULT 'application',
        parent_app_id           text,
        name                    text,
-       business_service_name    text,
+       business_service_name   text,
        app_criticality_assessment text,
        jira_backlog_id         text,
        lean_control_service_id text,
@@ -51,14 +51,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_application_name ON application(lower(name)
 -- RELEASE  (TEXT IDs)
 -- =========================
 CREATE TABLE release (
-                         release_id  text PRIMARY KEY,
-                         scope_type  text NOT NULL,   -- e.g., 'application'
-                         scope_id    text NOT NULL,   -- points to target row id (e.g., application.app_id)
-                         version     text NOT NULL,   -- semantic or numeric string
-                         window_start timestamptz,
-                         window_end   timestamptz,
-                         created_at   timestamptz NOT NULL DEFAULT now()
-    -- No FK on (scope_type, scope_id): polymorphic by design
+       release_id   text PRIMARY KEY,
+       scope_type   text NOT NULL,
+       scope_id     text NOT NULL,
+       version      text NOT NULL,
+       window_start timestamptz,
+       window_end   timestamptz,
+       created_at   timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_release_scope  ON release(scope_type, scope_id);
@@ -68,14 +67,14 @@ CREATE INDEX IF NOT EXISTS idx_release_window ON release(window_start, window_en
 -- PROFILE  (TEXT IDs)
 -- =========================
 CREATE TABLE profile (
-                         profile_id  text PRIMARY KEY,
-                         scope_type  text NOT NULL,          -- e.g., 'application'
-                         scope_id    text NOT NULL,          -- e.g., application.app_id
-                         version     integer NOT NULL,       -- profile schema version
-                         snapshot_at timestamptz NOT NULL DEFAULT now(),
-                         created_at  timestamptz NOT NULL DEFAULT now(),
-                         updated_at  timestamptz NOT NULL DEFAULT now(),
-                         CONSTRAINT uq_profile UNIQUE (scope_type, scope_id, version)
+       profile_id  text PRIMARY KEY,
+       scope_type  text NOT NULL,
+       scope_id    text NOT NULL,
+       version     integer NOT NULL,
+       snapshot_at timestamptz NOT NULL DEFAULT now(),
+       created_at  timestamptz NOT NULL DEFAULT now(),
+       updated_at  timestamptz NOT NULL DEFAULT now(),
+       CONSTRAINT uq_profile UNIQUE (scope_type, scope_id, version)
 );
 
 CREATE INDEX IF NOT EXISTS idx_profile_scope   ON profile(scope_type, scope_id);
@@ -85,77 +84,88 @@ CREATE INDEX IF NOT EXISTS idx_profile_version ON profile(version);
 -- PROFILE_FIELD  (TEXT IDs)
 -- =========================
 CREATE TABLE profile_field (
-                               id            text PRIMARY KEY,
-                               profile_id    text NOT NULL REFERENCES profile(profile_id) ON DELETE CASCADE,
-                               field_key     text NOT NULL,     -- namespaced key, e.g., 'app.criticality'
-                               value         jsonb,             -- store as jsonb for flexibility & indexing
-                               confidence    text,              -- e.g., 'derived','owner','system'
-                               source_system text,              -- provenance (e.g., 'ODS')
-                               source_ref    text,              -- upstream identifier
-                               collected_at  timestamptz,
-                               created_at    timestamptz NOT NULL DEFAULT now(),
-                               updated_at    timestamptz NOT NULL DEFAULT now(),
-                               CONSTRAINT uq_profile_field UNIQUE (profile_id, field_key)
+       id            text PRIMARY KEY,
+       profile_id    text NOT NULL REFERENCES profile(profile_id) ON DELETE CASCADE,
+       field_key     text NOT NULL,
+       value         jsonb,
+       confidence    text,
+       source_system text,
+       source_ref    text,
+       collected_at  timestamptz,
+       created_at    timestamptz NOT NULL DEFAULT now(),
+       updated_at    timestamptz NOT NULL DEFAULT now(),
+       CONSTRAINT uq_profile_field UNIQUE (profile_id, field_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_profile_field_profile ON profile_field(profile_id);
 CREATE INDEX IF NOT EXISTS idx_profile_field_key     ON profile_field(field_key);
--- Optional: JSONB GIN index if you’ll query by value frequently
--- CREATE INDEX IF NOT EXISTS idx_profile_field_value_gin ON profile_field USING gin (value jsonb_path_ops);
 
 -- =========================
--- EVIDENCE  (TEXT IDs)
+-- EVIDENCE  (TEXT IDs) with lifecycle fields
 -- =========================
 CREATE TABLE evidence (
-                          evidence_id      text PRIMARY KEY,
-                          profile_field_id text NOT NULL REFERENCES profile_field(id) ON DELETE CASCADE,
-                          uri              text NOT NULL,      -- link or storage URI
-                          type             text,               -- e.g., 'diagram','report','contract'
-                          added_at         timestamptz NOT NULL DEFAULT now(),
-                          CONSTRAINT uq_evidence_pf_uri UNIQUE (profile_field_id, uri)
+       evidence_id      text PRIMARY KEY,
+       profile_field_id text NOT NULL REFERENCES profile_field(id) ON DELETE CASCADE,
+       uri              text NOT NULL,
+       type             text,
+       sha256           text,             -- fingerprint for reuse/dedupe
+       source_system    text,             -- where it came from
+       submitted_by     text,             -- user/system subject
+       valid_from       timestamptz DEFAULT now(),
+       valid_until      timestamptz,
+       status           text NOT NULL DEFAULT 'active', -- active | superseded | revoked
+       revoked_at       timestamptz,
+       tags             text,
+       added_at         timestamptz NOT NULL DEFAULT now(),
+       CONSTRAINT uq_evidence_pf_uri UNIQUE (profile_field_id, uri),
+       CONSTRAINT chk_evidence_status CHECK (status IN ('active','superseded','revoked'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_evidence_pf ON evidence(profile_field_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_pf          ON evidence(profile_field_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_status      ON evidence(status);
+CREATE INDEX IF NOT EXISTS idx_evidence_valid_window ON evidence(valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_evidence_sha256      ON evidence(sha256);
 
 -- =========================
 -- POLICY_REQUIREMENT  (TEXT IDs)
 -- =========================
 CREATE TABLE policy_requirement (
-                                    requirement_id          text PRIMARY KEY,
-                                    domain                  text NOT NULL,         -- e.g., 'security','resilience'
-                                    policy_id               text NOT NULL,         -- logical policy identifier
-                                    scope_type              text NOT NULL,         -- e.g., 'application'
-                                    scope_id                text NOT NULL,         -- target entity id (polymorphic)
-                                    release_id              text REFERENCES release(release_id) ON DELETE CASCADE,
-                                    required_evidence_types text,                  -- list/JSON of evidence types
-                                    severity                text,                  -- e.g., 'blocker','high','medium','low'
-                                    due_date                timestamptz,
-                                    policy_version_applied  text,                  -- policy definition version
-                                    created_at              timestamptz NOT NULL DEFAULT now(),
-                                    updated_at              timestamptz NOT NULL DEFAULT now()
+       requirement_id          text PRIMARY KEY,
+       domain                  text NOT NULL,
+       policy_id               text NOT NULL,
+       scope_type              text NOT NULL,
+       scope_id                text NOT NULL,
+       release_id              text REFERENCES release(release_id) ON DELETE CASCADE,
+       required_evidence_types text,
+       severity                text,
+       due_date                timestamptz,
+       policy_version_applied  text,
+       created_at              timestamptz NOT NULL DEFAULT now(),
+       updated_at              timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_requirement_scope  ON policy_requirement(scope_type, scope_id);
+CREATE INDEX IF NOT EXISTS idx_requirement_scope   ON policy_requirement(scope_type, scope_id);
 CREATE INDEX IF NOT EXISTS idx_requirement_release ON policy_requirement(release_id);
 CREATE INDEX IF NOT EXISTS idx_requirement_domain  ON policy_requirement(domain);
 
 -- =========================
--- CONTROL_CLAIM  (TEXT IDs)
+-- CONTROL_CLAIM  (TEXT IDs) with decision_json
 -- =========================
 CREATE TABLE control_claim (
-                               claim_id      text PRIMARY KEY,
-                               requirement_id text REFERENCES policy_requirement(requirement_id) ON DELETE CASCADE,
-                               scope_type    text NOT NULL,
-                               scope_id      text NOT NULL,
-                               release_id    text REFERENCES release(release_id) ON DELETE SET NULL,
-                               method        text,               -- attestation/automation/test/etc.
-                               status        text,               -- submitted/approved/rejected/in_review
-                               submitted_at  timestamptz,
-                               reviewed_at   timestamptz,
-                               assigned_at   timestamptz,
-                               comment       text,
-                               created_at    timestamptz NOT NULL DEFAULT now(),
-                               updated_at    timestamptz NOT NULL DEFAULT now()
+       claim_id      text PRIMARY KEY,
+       requirement_id text REFERENCES policy_requirement(requirement_id) ON DELETE CASCADE,
+       scope_type    text NOT NULL,
+       scope_id      text NOT NULL,
+       release_id    text REFERENCES release(release_id) ON DELETE SET NULL,
+       method        text,
+       status        text,
+       submitted_at  timestamptz,
+       reviewed_at   timestamptz,
+       assigned_at   timestamptz,
+       comment       text,
+       decision_json jsonb,   -- OPA or reviewer decision details
+       created_at    timestamptz NOT NULL DEFAULT now(),
+       updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_claim_requirement ON control_claim(requirement_id);
@@ -166,82 +176,79 @@ CREATE INDEX IF NOT EXISTS idx_claim_release     ON control_claim(release_id);
 -- RISK_STORY  (TEXT IDs)
 -- =========================
 CREATE TABLE risk_story (
-                            risk_key    text PRIMARY KEY,
-                            domain      text NOT NULL,    -- e.g., 'security','data'
-                            status      text NOT NULL,    -- e.g., 'open','mitigated','accepted','closed'
-                            scope_type  text NOT NULL,
-                            scope_id    text NOT NULL,
-                            release_id  text REFERENCES release(release_id) ON DELETE SET NULL,
-                            sla_due     timestamptz,
-                            created_at  timestamptz NOT NULL DEFAULT now(),
-                            updated_at  timestamptz NOT NULL DEFAULT now()
+       risk_key    text PRIMARY KEY,
+       domain      text NOT NULL,
+       status      text NOT NULL,
+       scope_type  text NOT NULL,
+       scope_id    text NOT NULL,
+       release_id  text REFERENCES release(release_id) ON DELETE SET NULL,
+       sla_due     timestamptz,
+       created_at  timestamptz NOT NULL DEFAULT now(),
+       updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_risk_scope   ON risk_story(scope_type, scope_id);
 CREATE INDEX IF NOT EXISTS idx_risk_release ON risk_story(release_id);
 
 -- =========================
--- Triggers: keep updated_at fresh on UPDATE
+-- Triggers: keep updated_at fresh
 -- =========================
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   NEW.updated_at = now();
-RETURN NEW;
+  RETURN NEW;
 END$$;
 
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_application_updated_at') THEN
-CREATE TRIGGER trg_application_updated_at BEFORE UPDATE ON application
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-END IF;
+    CREATE TRIGGER trg_application_updated_at BEFORE UPDATE ON application
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_profile_updated_at') THEN
-CREATE TRIGGER trg_profile_updated_at BEFORE UPDATE ON profile
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-END IF;
+    CREATE TRIGGER trg_profile_updated_at BEFORE UPDATE ON profile
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_profile_field_updated_at') THEN
-CREATE TRIGGER trg_profile_field_updated_at BEFORE UPDATE ON profile_field
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-END IF;
+    CREATE TRIGGER trg_profile_field_updated_at BEFORE UPDATE ON profile_field
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_policy_requirement_updated_at') THEN
-CREATE TRIGGER trg_policy_requirement_updated_at BEFORE UPDATE ON policy_requirement
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-END IF;
+    CREATE TRIGGER trg_policy_requirement_updated_at BEFORE UPDATE ON policy_requirement
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_control_claim_updated_at') THEN
-CREATE TRIGGER trg_control_claim_updated_at BEFORE UPDATE ON control_claim
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-END IF;
+    CREATE TRIGGER trg_control_claim_updated_at BEFORE UPDATE ON control_claim
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_risk_story_updated_at') THEN
-CREATE TRIGGER trg_risk_story_updated_at BEFORE UPDATE ON risk_story
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-END IF;
+    CREATE TRIGGER trg_risk_story_updated_at BEFORE UPDATE ON risk_story
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
 END$$;
 
 -- =========================
 -- Helpful views
 -- =========================
-
--- Latest profile per application
 CREATE OR REPLACE VIEW v_app_profiles_latest AS
 SELECT p.*
 FROM profile p
-         JOIN (
+JOIN (
     SELECT scope_type, scope_id, MAX(version) AS max_version
     FROM profile
     WHERE scope_type = 'application'
     GROUP BY scope_type, scope_id
 ) lv
-              ON p.scope_type = lv.scope_type
-                  AND p.scope_id   = lv.scope_id
-                  AND p.version    = lv.max_version;
+  ON p.scope_type = lv.scope_type
+ AND p.scope_id   = lv.scope_id
+ AND p.version    = lv.max_version;
 
--- Flattened profile fields for quick querying
 CREATE OR REPLACE VIEW v_profile_fields AS
 SELECT p.scope_type,
        p.scope_id,
@@ -252,4 +259,4 @@ SELECT p.scope_type,
        f.source_ref,
        f.collected_at
 FROM profile p
-         JOIN profile_field f ON f.profile_id = p.profile_id;
+JOIN profile_field f ON f.profile_id = p.profile_id;
