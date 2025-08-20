@@ -15,6 +15,7 @@ DROP TABLE IF EXISTS risk_story CASCADE;
 DROP TABLE IF EXISTS release CASCADE;
 DROP TABLE IF EXISTS application CASCADE;
 
+
 -- =========================
 -- APPLICATION  (TEXT IDs)
 -- =========================
