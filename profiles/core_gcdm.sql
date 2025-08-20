@@ -134,6 +134,7 @@ CREATE TABLE evidence (
                               CHECK (method IS NULL OR method IN ('auto','manual','attested'))
 );
 
+
 CREATE INDEX IF NOT EXISTS idx_evidence_pf           ON evidence(profile_field_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_revoked_at   ON evidence(revoked_at);
 CREATE INDEX IF NOT EXISTS idx_evidence_valid_window ON evidence(valid_from, valid_until);
