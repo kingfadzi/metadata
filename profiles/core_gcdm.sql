@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS application (
            business_service_name        text,
            app_criticality_assessment   text,
            security_rating              text,
+           confidentiality_rating       text,
            integrity_rating             text,
            availability_rating          text,
            resilience_rating            text,
