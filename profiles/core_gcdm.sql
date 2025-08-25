@@ -129,6 +129,7 @@ CREATE TABLE profile_field (
                                id            text PRIMARY KEY,
                                profile_id    text NOT NULL REFERENCES profile(profile_id) ON DELETE CASCADE,
                                field_key     text NOT NULL,
+                               derived_from  text NOT NULL,
                                value         jsonb,
                                confidence    text,
                                source_system text,
