@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# seed -> create profiles -> write md+json -> push -> post (minimal, with verb+noun names)
+# seed -> create profiles -> write md+json -> push -> post (minimal, with svc/apm ids)
 
 import os, sys, json, uuid, random, argparse, glob
 from datetime import datetime, timedelta
@@ -66,26 +66,35 @@ def raw_url(rel_path: str) -> str:
 def _uuid() -> str:
     return str(uuid.uuid4())
 
-# APM correlation-id generator (simple counter; resets per run)
+# APM correlation-id generator (for application correlation IDs)
 _apm_counter = 100000
 def apm_id() -> str:
-    """Generate ServiceNow-style Application Correlation ID: APM123456"""
     global _apm_counter
     _apm_counter += 1
     return f"APM{_apm_counter}"
 
+# SVC correlation-id generator (for business service correlation IDs)
+_svc_counter = 300000
+def svc_id() -> str:
+    global _svc_counter
+    _svc_counter += 1
+    return f"SVC{_svc_counter}"
+
 def gen_app_name() -> str:
-    """Generate readable app names using adjective + noun"""
     return f"{random.choice(ADJECTIVES)}-{random.choice(NOUNS)}-{random.randint(100,999)}"
 
 # ================== STEP 1: Seed apps ==================
 def seed_one(cur) -> str:
-    # Business Service (sysid = UUID)
+    # Business Service (sysid UUID + NOT NULL correlation id)
     bs_sysid = _uuid()
-    cur.execute(
-        "INSERT INTO public.spdw_vwsfitbusinessservice (it_business_service_sysid, service) VALUES (%s,%s)",
-        (bs_sysid, f"Service-{random.randint(100,999)}")
-    )
+    bs_corr  = svc_id()
+    bs_name  = f"Service-{random.randint(100,999)}"
+    cur.execute("""
+        INSERT INTO public.spdw_vwsfitbusinessservice
+            (it_business_service_sysid, service_correlation_id, service)
+        VALUES
+            (%s, %s, %s)
+    """, (bs_sysid, bs_corr, bs_name))
 
     # Service Offering (join key = UUID)
     so_join = _uuid()
