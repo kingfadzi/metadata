@@ -64,32 +64,42 @@ def _uuid() -> str:
 def gen_app_name() -> str:
     return f"{random.choice(ADJECTIVES)}-{random.choice(NOUNS)}-{random.randint(100,999)}"
 
-# ---- “Next value” helpers (read from DB to avoid collisions) ----
+# --- DB-driven "next value" helpers (avoid dupes) ---
 def _next_prefixed(cur, table: str, col: str, prefix: str, default_base: int) -> str:
     """
-    Returns next id like f"{prefix}{N}" where N = max(trailing_digits(col)) + 1,
-    or default_base+1 if none.
+    Returns next id like f"{prefix}{N}" where N = MAX(trailing_digits(col)) + 1,
+    or default_base+1 if none. Works even if col is TEXT.
     """
-    # note: we use E'..' to simplify escaping; psycopg2 param handles default_base
-    sql = f"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE({col}, E'\\\\D', '', 'g') AS INTEGER)), %s) + 1 FROM {table}"
+    sql = f"""
+        SELECT COALESCE(
+                 MAX(CAST(REGEXP_REPLACE({col}, E'\\D', '', 'g') AS INTEGER)),
+                 %s
+               ) + 1
+        FROM {table}
+    """
     cur.execute(sql, (default_base,))
     nxt = int(cur.fetchone()[0])
     return f"{prefix}{nxt}"
 
-def _next_int(cur, table: str, col: str, default_base: int) -> int:
-    sql = f"SELECT COALESCE(MAX({col}), %s) + 1 FROM {table}"
+def _next_so_join(cur, default_base: int = 400000) -> int:
+    """service_offering_join as INT: MAX()+1; if column is INT this works cleanly."""
+    sql = "SELECT COALESCE(MAX(service_offering_join), %s) + 1 FROM public.spdw_vwsfserviceoffering"
     cur.execute(sql, (default_base,))
     return int(cur.fetchone()[0])
 
+def _random_cycle_id() -> str:
+    """owning_transaction_cycle_id is TEXT: return '1'..'30' as string."""
+    return str(random.randint(1, 30))
+
 # ================== STEP 1: Seed apps ==================
 def seed_one(cur) -> str:
-    # Derive unique ids on-demand from DB state
-    svc_corr   = _next_prefixed(cur, "public.spdw_vwsfitbusinessservice", "service_correlation_id", "SVC", 300000)
-    sof_corr   = _next_prefixed(cur, "public.spdw_vwsfserviceoffering",   "correlation_id",         "SOF", 350000)
-    app_corr   = _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
-    parent_corr= _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
-    so_join    = _next_int(cur, "public.spdw_vwsfserviceoffering",        "service_offering_join",  400000)
-    cycle_id   = _next_int(cur, "public.spdw_vwsfbusinessapplication",    "owning_transaction_cycle_id", 500000)
+    # Allocate unique IDs (from current DB state)
+    svc_corr    = _next_prefixed(cur, "public.spdw_vwsfitbusinessservice", "service_correlation_id", "SVC", 300000)
+    sof_corr    = _next_prefixed(cur, "public.spdw_vwsfserviceoffering",   "correlation_id",         "SOF", 350000)
+    app_corr    = _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
+    parent_corr = _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
+    so_join     = _next_so_join(cur)         # INT
+    cycle_id    = _random_cycle_id()         # TEXT "1".."30"
 
     # Business Service
     bs_sysid = _uuid()
@@ -136,7 +146,7 @@ def seed_one(cur) -> str:
         random.choice(APPLICATION_TYPES), random.choice(APPLICATION_TIERS),
         random.choice(ARCHITECTURE_TYPES), random.choice(INSTALL_TYPES),
         random.choice(HOUSE_POSITIONS), random.choice(STATUSES),
-        random.choice(CYCLES), cycle_id,  # INT
+        random.choice(CYCLES), cycle_id,  # TEXT id
         "Owner Name", "u12345", "Architect Name", "u54321",
         ba_sys_id, "Parent", parent_corr, random.choice(HOSTING)
     ))
