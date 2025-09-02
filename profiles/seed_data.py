@@ -76,6 +76,7 @@ def _next_prefixed(cur, table: str, col: str, prefix: str, default_base: int) ->
                  %s
                ) + 1
         FROM {table}
+        WHERE REGEXP_REPLACE({col}, E'\\D', '', 'g') ~ '^[0-9]+$'
     """
     cur.execute(sql, (default_base,))
     nxt = int(cur.fetchone()[0])
@@ -92,14 +93,8 @@ def _random_cycle_id() -> str:
     return str(random.randint(1, 30))
 
 # ================== STEP 1: Seed apps ==================
-def seed_one(cur) -> str:
-    # Allocate unique IDs (from current DB state)
-    svc_corr    = _next_prefixed(cur, "public.spdw_vwsfitbusinessservice", "service_correlation_id", "SVC", 300000)
-    sof_corr    = _next_prefixed(cur, "public.spdw_vwsfserviceoffering",   "correlation_id",         "SOF", 350000)
-    app_corr    = _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
-    parent_corr = _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
-    so_join     = _next_so_join(cur)         # INT
-    cycle_id    = _random_cycle_id()         # TEXT "1".."30"
+def seed_one_with_ids(cur, svc_corr: str, sof_corr: str, app_corr: str, parent_corr: str, so_join: int) -> str:
+    cycle_id = _random_cycle_id()  # TEXT "1".."30"
 
     # Business Service
     bs_sysid = _uuid()
@@ -115,16 +110,23 @@ def seed_one(cur) -> str:
     cur.execute("""
         INSERT INTO public.spdw_vwsfserviceoffering (
             correlation_id,
-            app_criticality_assessment, security_rating, confidentiality_rating,
-            integrity_rating, availability_rating, resiliency_category,
-            service_offering_join
+            resiliency_category,
+            app_criticality_assessment,
+            availability_rating,
+            confidentiality_rating,
+            integrity_rating,
+            service_offering_join,
+            security_rating
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         sof_corr,
-        random.choice(ABCD), random.choice(SECURITY_RATINGS),
-        random.choice(ABCD), random.choice(ABCD), random.choice(ABCD),
-        random.choice(RESILIENCY),
-        so_join
+        int(random.choice(RESILIENCY)),  # smallint field
+        random.choice(ABCD),
+        random.choice(ABCD),
+        random.choice(ABCD),
+        random.choice(ABCD),
+        so_join,
+        random.choice(SECURITY_RATINGS)
     ))
 
     # Business Application
@@ -166,7 +168,26 @@ def seed_apps(n: int) -> List[str]:
     try:
         with conn:
             with conn.cursor() as cur:
-                ids = [seed_one(cur) for _ in range(n)]
+                # Pre-allocate all IDs to avoid duplicates
+                base_svc = _next_prefixed(cur, "public.spdw_vwsfitbusinessservice", "service_correlation_id", "SVC", 300000)
+                base_sof = _next_prefixed(cur, "public.spdw_vwsfserviceoffering", "correlation_id", "SOF", 350000) 
+                base_app = _next_prefixed(cur, "public.spdw_vwsfbusinessapplication", "correlation_id", "APM", 100000)
+                base_so_join = _next_so_join(cur)
+                
+                # Extract numeric parts
+                svc_num = int(base_svc[3:])  # Remove "SVC" prefix
+                sof_num = int(base_sof[3:])  # Remove "SOF" prefix  
+                app_num = int(base_app[3:])  # Remove "APM" prefix
+                
+                ids = []
+                for i in range(n):
+                    ids.append(seed_one_with_ids(cur, 
+                        f"SVC{svc_num + i}",
+                        f"SOF{sof_num + i}", 
+                        f"APM{app_num + i}",
+                        f"APM{app_num + i + n}",  # parent_corr offset by n
+                        base_so_join + i
+                    ))
         return ids
     finally:
         conn.close()
@@ -176,7 +197,12 @@ def create_profile(app_id: str) -> None:
     url = f"{COCKPIT_API_BASE}/api/apps"
     headers = {"Content-Type": "application/json"}
     if COCKPIT_API_TOKEN: headers["Authorization"] = COCKPIT_API_TOKEN
-    requests.post(url, headers=headers, data=json.dumps({"appId": app_id}))
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps({"appId": app_id}), timeout=30)
+        if r.status_code not in (200, 201, 409):  # 409 = already exists
+            raise RuntimeError(f"Failed to create profile for {app_id}: HTTP {r.status_code} - {r.text[:200]}")
+    except requests.RequestException as e:
+        raise RuntimeError(f"Network error creating profile for {app_id}: {e}") from e
 
 # ================== STEP 3: Write MD+JSON and push ==================
 def ensure_repo() -> Repo:
@@ -188,9 +214,17 @@ def ensure_repo() -> Repo:
 def fetch_profile(app_id: str) -> Optional[Dict[str, Any]]:
     headers = {}
     if COCKPIT_API_TOKEN: headers["Authorization"] = COCKPIT_API_TOKEN
-    r = requests.get(f"{COCKPIT_API_BASE}/api/apps/{app_id}/profile", headers=headers, timeout=30)
-    if r.status_code != 200: return None
-    return r.json()
+    try:
+        r = requests.get(f"{COCKPIT_API_BASE}/api/apps/{app_id}/profile", headers=headers, timeout=30)
+        if r.status_code == 404:
+            return None  # Profile doesn't exist yet, this is expected
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to fetch profile for {app_id}: HTTP {r.status_code} - {r.text[:200]}")
+        return r.json()
+    except (ValueError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"Invalid JSON response for app {app_id}: {r.text[:200]}") from e
+    except requests.RequestException as e:
+        raise RuntimeError(f"Network error fetching profile for {app_id}: {e}") from e
 
 def flatten_fields(profile: Dict[str, Any]) -> List[Tuple[Dict[str, Any], List[str]]]:
     out: List[Tuple[Dict[str, Any], List[str]]] = []
@@ -239,6 +273,7 @@ def generate_and_push(app_ids: List[str]) -> None:
             base = f"{EVIDENCE_ROOT}/{app_id}"
             md_rel = f"{base}/{app_id}_{safe}.md"
             json_rel = f"{base}/{app_id}_{safe}.json"
+            os.makedirs(os.path.join(WORKDIR, base), exist_ok=True)
             with open(os.path.join(WORKDIR, md_rel), "w", encoding="utf-8") as f:
                 f.write(md_content(app_id, fkey, pfid))
             with open(os.path.join(WORKDIR, json_rel), "w", encoding="utf-8") as f:
@@ -252,19 +287,53 @@ def post_evidence(app_id: str) -> None:
     headers = {"Content-Type":"application/json"}
     if COCKPIT_API_TOKEN: headers["Authorization"] = COCKPIT_API_TOKEN
     root = os.path.join(WORKDIR, EVIDENCE_ROOT, app_id)
-    for p in glob.glob(os.path.join(root, f"{app_id}_*.json")):
-        with open(p, "r", encoding="utf-8") as f:
-            body = json.load(f)
-        requests.post(
-            f"{COCKPIT_API_BASE}/api/apps/{app_id}/evidence/with-document",
-            headers=headers, data=json.dumps(body)
-        )
+    if not os.path.exists(root):
+        raise RuntimeError(f"No evidence directory found for {app_id} at {root}")
+    
+    evidence_files = glob.glob(os.path.join(root, f"{app_id}_*.json"))
+    if not evidence_files:
+        raise RuntimeError(f"No evidence files found for {app_id} in {root}")
+    
+    for p in evidence_files:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                body = json.load(f)
+            r = requests.post(
+                f"{COCKPIT_API_BASE}/api/apps/{app_id}/evidence/with-document",
+                headers=headers, data=json.dumps(body), timeout=30
+            )
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"Failed to post evidence {os.path.basename(p)}: HTTP {r.status_code} - {r.text[:200]}")
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid JSON in evidence file {os.path.basename(p)}: {e}") from e
+        except requests.RequestException as e:
+            raise RuntimeError(f"Network error posting evidence {os.path.basename(p)}: {e}") from e
 
 # ================== ORCHESTRATOR ==================
+def clean_tables():
+    """Clean all seeded data from tables"""
+    conn = psycopg2.connect(**DB)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                print("Cleaning existing seeded data...")
+                # Delete in reverse dependency order
+                cur.execute("DELETE FROM public.spdw_vwsfitserviceinstance")
+                cur.execute("DELETE FROM public.spdw_vwsfbusinessapplication WHERE correlation_id LIKE 'APM%'")
+                cur.execute("DELETE FROM public.spdw_vwsfserviceoffering WHERE correlation_id LIKE 'SOF%'") 
+                cur.execute("DELETE FROM public.spdw_vwsfitbusinessservice WHERE service_correlation_id LIKE 'SVC%'")
+                print("Tables cleaned.")
+    finally:
+        conn.close()
+
 def main():
     ap = argparse.ArgumentParser(description="Seed -> create profiles -> md+json -> push -> post")
     ap.add_argument("-n", "--count", type=int, required=True, help="How many apps to seed")
+    ap.add_argument("--clean", action="store_true", help="Clean existing seeded data first")
     args = ap.parse_args()
+
+    if args.clean:
+        clean_tables()
 
     app_ids = seed_apps(args.count)
     print("Seeded appIds:", app_ids)
