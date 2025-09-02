@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# seed -> create profiles -> write md+json -> push -> post (minimal, with svc/apm ids, int joins)
+# seed -> create profiles -> write md+json -> push -> post (minimal, with svc/apm/sof ids, int joins)
 
 import os, sys, json, uuid, random, argparse, glob
 from datetime import datetime, timedelta
@@ -47,14 +47,8 @@ RESILIENCY = ["0","1","2","3","4"]
 HOSTING = ["AWS","Azure","GCP","OnPremCluster"]
 
 # Adjectives + Nouns for app names
-ADJECTIVES = [
-    "swift","prime","stellar","lunar","emerald","cobalt","vivid",
-    "crimson","golden","onyx","quantum","silent","rapid","brisk"
-]
-NOUNS = [
-    "atlas","harbor","forge","matrix","beacon","vertex","cascade",
-    "nova","horizon","anchor","circuit","compass","cipher","pillar"
-]
+ADJECTIVES = ["swift","prime","stellar","lunar","emerald","cobalt","vivid","crimson","golden","onyx","quantum","silent","rapid","brisk"]
+NOUNS      = ["atlas","harbor","forge","matrix","beacon","vertex","cascade","nova","horizon","anchor","circuit","compass","cipher","pillar"]
 
 # ================== HELPERS ==================
 def sanitize_key(s: str) -> str:
@@ -68,30 +62,32 @@ def _uuid() -> str:
 
 # Correlation-id generators
 _apm_counter = 100000
-def apm_id() -> str:
-    """Application correlation id: APM123456"""
+def apm_id() -> str:  # Application correlation id APM######
     global _apm_counter
     _apm_counter += 1
     return f"APM{_apm_counter}"
 
 _svc_counter = 300000
-def svc_id() -> str:
-    """Business service correlation id: SVC123456"""
+def svc_id() -> str:  # Business Service correlation id SVC######
     global _svc_counter
     _svc_counter += 1
     return f"SVC{_svc_counter}"
 
+_sof_corr_counter = 350000
+def sof_id() -> str:  # Service Offering correlation id SOF######
+    global _sof_corr_counter
+    _sof_corr_counter += 1
+    return f"SOF{_sof_corr_counter}"
+
 # INT counters for integer columns
 _so_join_counter = 400000
-def next_so_join() -> int:
-    """Integer join key for service_offering_join."""
+def next_so_join() -> int:  # service_offering_join (INT)
     global _so_join_counter
     _so_join_counter += 1
     return _so_join_counter
 
 _cycle_id_counter = 500000
-def next_cycle_id() -> int:
-    """Integer owning_transaction_cycle_id."""
+def next_cycle_id() -> int:  # owning_transaction_cycle_id (INT)
     global _cycle_id_counter
     _cycle_id_counter += 1
     return _cycle_id_counter
@@ -112,22 +108,28 @@ def seed_one(cur) -> str:
             (%s, %s, %s)
     """, (bs_sysid, bs_corr, bs_name))
 
-    # Service Offering (JOIN = INT)
-    so_join = next_so_join()  # <-- INT, not UUID
+    # Service Offering (JOIN = INT, correlation_id NOT NULL)
+    so_join   = next_so_join()  # INT
+    so_corr   = sof_id()        # SOF######
     cur.execute("""
         INSERT INTO public.spdw_vwsfserviceoffering (
-            service_offering_join, app_criticality_assessment, security_rating,
-            confidentiality_rating, integrity_rating, availability_rating, resiliency_category
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+            correlation_id,
+            app_criticality_assessment, security_rating, confidentiality_rating,
+            integrity_rating, availability_rating, resiliency_category,
+            service_offering_join
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
-        so_join, random.choice(ABCD), random.choice(SECURITY_RATINGS),
-        random.choice(ABCD), random.choice(ABCD), random.choice(ABCD), random.choice(RESILIENCY)
+        so_corr,
+        random.choice(ABCD), random.choice(SECURITY_RATINGS),
+        random.choice(ABCD), random.choice(ABCD), random.choice(ABCD),
+        random.choice(RESILIENCY),
+        so_join
     ))
 
     # Business Application
-    app_corr_id = apm_id()          # correlation_id in APM##### format
-    parent_corr = apm_id()          # parent correlation id also APM#####
-    ba_sys_id   = _uuid()           # sys_id is UUID
+    app_corr_id = apm_id()          # APM######
+    parent_corr = apm_id()          # APM######
+    ba_sys_id   = _uuid()           # UUID sys_id
     app_name    = gen_app_name()
     cur.execute("""
         INSERT INTO public.spdw_vwsfbusinessapplication (
@@ -145,7 +147,7 @@ def seed_one(cur) -> str:
         random.choice(APPLICATION_TYPES), random.choice(APPLICATION_TIERS),
         random.choice(ARCHITECTURE_TYPES), random.choice(INSTALL_TYPES),
         random.choice(HOUSE_POSITIONS), random.choice(STATUSES),
-        random.choice(CYCLES), next_cycle_id(),   # <-- INT, not UUID
+        random.choice(CYCLES), next_cycle_id(),   # INT
         "Owner Name", "u12345", "Architect Name", "u54321",
         ba_sys_id, "Parent", parent_corr, random.choice(HOSTING)
     ))
@@ -156,7 +158,7 @@ def seed_one(cur) -> str:
         INSERT INTO public.spdw_vwsfitserviceinstance (
             service_instance_sysid, it_business_service_sysid, business_application_sysid, service_offering_join
         ) VALUES (%s,%s,%s,%s)
-    """, (si_sysid, bs_sysid, ba_sys_id, so_join))  # so_join is INT here as well
+    """, (si_sysid, bs_sysid, ba_sys_id, so_join))  # so_join is INT
 
     return app_corr_id
 
