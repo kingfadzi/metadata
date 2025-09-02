@@ -22,7 +22,7 @@ if not GITLAB_API_TOKEN:
     sys.exit(1)
 
 GIT_SERVER   = "eros.butterflycluster.com"
-GIT_GROUP    = "staging"   # group changed to staging
+GIT_GROUP    = "staging"
 GIT_PROJECT  = "dummy_evidence"
 GIT_BRANCH   = "main"
 WORKDIR      = "/tmp/evidence-repo"
@@ -64,93 +64,44 @@ def _uuid() -> str:
 def gen_app_name() -> str:
     return f"{random.choice(ADJECTIVES)}-{random.choice(NOUNS)}-{random.randint(100,999)}"
 
-# ---- Global counters (initialized from DB) ----
-_apm_counter = 100000           # APM for application correlation_id
-_svc_counter = 300000           # SVC for business service correlation_id
-_sof_corr_counter = 350000      # SOF for service offering correlation_id
-_so_join_counter = 400000       # INT service_offering_join
-_cycle_id_counter = 500000      # INT owning_transaction_cycle_id
-
-def apm_id() -> str:
-    global _apm_counter
-    _apm_counter += 1
-    return f"APM{_apm_counter}"
-
-def svc_id() -> str:
-    global _svc_counter
-    _svc_counter += 1
-    return f"SVC{_svc_counter}"
-
-def sof_id() -> str:
-    global _sof_corr_counter
-    _sof_corr_counter += 1
-    return f"SOF{_sof_corr_counter}"
-
-def next_so_join() -> int:
-    global _so_join_counter
-    _so_join_counter += 1
-    return _so_join_counter
-
-def next_cycle_id() -> int:
-    global _cycle_id_counter
-    _cycle_id_counter += 1
-    return _cycle_id_counter
-
-def _fetch_max_suffix(cur, table: str, col: str, prefix: str, default_base: int) -> int:
+# ---- “Next value” helpers (read from DB to avoid collisions) ----
+def _next_prefixed(cur, table: str, col: str, prefix: str, default_base: int) -> str:
     """
-    Read max numeric suffix from a correlation id column like 'SVC123456'.
-    Returns the max number found or default_base if none present.
+    Returns next id like f"{prefix}{N}" where N = max(trailing_digits(col)) + 1,
+    or default_base+1 if none.
     """
-    # Extract trailing digits and cast to int
-    sql = f"SELECT COALESCE(MAX(CAST(SUBSTRING({col} FROM '\\\\d+$') AS INTEGER)), %s) FROM {table}"
-    try:
-        cur.execute(sql, (default_base,))
-        val = cur.fetchone()[0]
-        return int(val if val is not None else default_base)
-    except Exception:
-        return default_base
+    # note: we use E'..' to simplify escaping; psycopg2 param handles default_base
+    sql = f"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE({col}, E'\\\\D', '', 'g') AS INTEGER)), %s) + 1 FROM {table}"
+    cur.execute(sql, (default_base,))
+    nxt = int(cur.fetchone()[0])
+    return f"{prefix}{nxt}"
 
-def _fetch_max_int(cur, table: str, col: str, default_base: int) -> int:
-    sql = f"SELECT COALESCE(MAX({col}), %s) FROM {table}"
-    try:
-        cur.execute(sql, (default_base,))
-        val = cur.fetchone()[0]
-        return int(val if val is not None else default_base)
-    except Exception:
-        return default_base
-
-def init_counters_from_db():
-    """Advance all counters to be greater than anything already in the DB."""
-    global _apm_counter, _svc_counter, _sof_corr_counter, _so_join_counter, _cycle_id_counter
-    conn = psycopg2.connect(**DB)
-    try:
-        with conn.cursor() as cur:
-            # Correlation IDs with prefixes
-            _svc_counter       = _fetch_max_suffix(cur, "public.spdw_vwsfitbusinessservice", "service_correlation_id", "SVC", _svc_counter)
-            _sof_corr_counter  = _fetch_max_suffix(cur, "public.spdw_vwsfserviceoffering",   "correlation_id",         "SOF", _sof_corr_counter)
-            _apm_counter       = _fetch_max_suffix(cur, "public.spdw_vwsfbusinessapplication","correlation_id",         "APM", _apm_counter)
-            # Integers
-            _so_join_counter   = _fetch_max_int(cur, "public.spdw_vwsfserviceoffering",      "service_offering_join",  _so_join_counter)
-            _cycle_id_counter  = _fetch_max_int(cur, "public.spdw_vwsfbusinessapplication",  "owning_transaction_cycle_id", _cycle_id_counter)
-    finally:
-        conn.close()
+def _next_int(cur, table: str, col: str, default_base: int) -> int:
+    sql = f"SELECT COALESCE(MAX({col}), %s) + 1 FROM {table}"
+    cur.execute(sql, (default_base,))
+    return int(cur.fetchone()[0])
 
 # ================== STEP 1: Seed apps ==================
 def seed_one(cur) -> str:
-    # Business Service (sysid UUID + NOT NULL correlation id)
+    # Derive unique ids on-demand from DB state
+    svc_corr   = _next_prefixed(cur, "public.spdw_vwsfitbusinessservice", "service_correlation_id", "SVC", 300000)
+    sof_corr   = _next_prefixed(cur, "public.spdw_vwsfserviceoffering",   "correlation_id",         "SOF", 350000)
+    app_corr   = _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
+    parent_corr= _next_prefixed(cur, "public.spdw_vwsfbusinessapplication","correlation_id",        "APM", 100000)
+    so_join    = _next_int(cur, "public.spdw_vwsfserviceoffering",        "service_offering_join",  400000)
+    cycle_id   = _next_int(cur, "public.spdw_vwsfbusinessapplication",    "owning_transaction_cycle_id", 500000)
+
+    # Business Service
     bs_sysid = _uuid()
-    bs_corr  = svc_id()
     bs_name  = f"Service-{random.randint(100,999)}"
     cur.execute("""
         INSERT INTO public.spdw_vwsfitbusinessservice
             (it_business_service_sysid, service_correlation_id, service)
         VALUES
             (%s, %s, %s)
-    """, (bs_sysid, bs_corr, bs_name))
+    """, (bs_sysid, svc_corr, bs_name))
 
-    # Service Offering (JOIN = INT, correlation_id NOT NULL)
-    so_join = next_so_join()     # INT
-    so_corr = sof_id()           # SOF######
+    # Service Offering
     cur.execute("""
         INSERT INTO public.spdw_vwsfserviceoffering (
             correlation_id,
@@ -159,7 +110,7 @@ def seed_one(cur) -> str:
             service_offering_join
         ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
-        so_corr,
+        sof_corr,
         random.choice(ABCD), random.choice(SECURITY_RATINGS),
         random.choice(ABCD), random.choice(ABCD), random.choice(ABCD),
         random.choice(RESILIENCY),
@@ -167,8 +118,6 @@ def seed_one(cur) -> str:
     ))
 
     # Business Application
-    app_corr_id = apm_id()       # APM######
-    parent_corr = apm_id()       # APM######
     ba_sys_id   = _uuid()        # UUID sys_id
     app_name    = gen_app_name()
     cur.execute("""
@@ -182,24 +131,24 @@ def seed_one(cur) -> str:
         )
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
-        app_corr_id,
+        app_corr,
         app_name,
         random.choice(APPLICATION_TYPES), random.choice(APPLICATION_TIERS),
         random.choice(ARCHITECTURE_TYPES), random.choice(INSTALL_TYPES),
         random.choice(HOUSE_POSITIONS), random.choice(STATUSES),
-        random.choice(CYCLES), next_cycle_id(),  # INT
+        random.choice(CYCLES), cycle_id,  # INT
         "Owner Name", "u12345", "Architect Name", "u54321",
         ba_sys_id, "Parent", parent_corr, random.choice(HOSTING)
     ))
 
-    # Service Instance row (only columns used by your joins)
+    # Service Instance (only columns used by your joins)
     cur.execute("""
         INSERT INTO public.spdw_vwsfitserviceinstance (
             it_business_service_sysid, business_application_sysid, service_offering_join
         ) VALUES (%s,%s,%s)
     """, (bs_sysid, ba_sys_id, so_join))
 
-    return app_corr_id
+    return app_corr
 
 def seed_apps(n: int) -> List[str]:
     if n <= 0: return []
@@ -306,9 +255,6 @@ def main():
     ap = argparse.ArgumentParser(description="Seed -> create profiles -> md+json -> push -> post")
     ap.add_argument("-n", "--count", type=int, required=True, help="How many apps to seed")
     args = ap.parse_args()
-
-    # Make counters unique w.r.t existing rows:
-    init_counters_from_db()
 
     app_ids = seed_apps(args.count)
     print("Seeded appIds:", app_ids)
