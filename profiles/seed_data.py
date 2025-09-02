@@ -22,7 +22,7 @@ if not GITLAB_API_TOKEN:
     sys.exit(1)
 
 GIT_SERVER   = "eros.butterflycluster.com"
-GIT_GROUP    = "experiments"
+GIT_GROUP    = "staging"
 GIT_PROJECT  = "dummy_evidence"
 GIT_BRANCH   = "main"
 WORKDIR      = "/tmp/evidence-repo"
